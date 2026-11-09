@@ -8,7 +8,7 @@ import framebuf
 from machine import Pin, I2C
 from ssd1306 import SSD1306_I2C
 
-Python
+
 # =========================================================================
 # 1. LOAD CONFIGURATION FROM .ENV FILE
 # =========================================================================
