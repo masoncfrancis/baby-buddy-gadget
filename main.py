@@ -8,36 +8,49 @@ import framebuf
 from machine import Pin, I2C
 from ssd1306 import SSD1306_I2C
 
+Python
 # =========================================================================
-# 1. NETWORK & BABY BUDDY CONFIGURATION
+# 1. LOAD CONFIGURATION FROM .ENV FILE
 # =========================================================================
-WIFI_SSID = "YOUR_WIFI_SSID"
-WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
-BABY_BUDDY_BASE_URL = "http://192.168.1.100:8000"  # No trailing slash
-CHILD_ID = 1
+env = {}
+try:
+    with open(".env", "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                env[key.strip()] = val.strip()
+except OSError:
+    print("WARNING: .env file not found on board!")
 
-# Set to False while running on USB power (keeps Thonny USB connection alive).
-# Change to True once you run on battery power for multi-week battery life!
-ENABLE_CPU_UNDERCLOCK = False
+WIFI_SSID = env.get("WIFI_SSID", "")
+WIFI_PASSWORD = env.get("WIFI_PASSWORD", "")
+BABY_BUDDY_BASE_URL = env.get("BABY_BUDDY_BASE_URL", "http://192.168.1.100:8000")
+
+# Safely convert integer fields from strings
+try:
+    CHILD_ID = int(env.get("CHILD_ID", "1"))
+except ValueError:
+    CHILD_ID = 1
 
 # =========================================================================
-# 2. HARDWARE PINOUT (MATCHING YOUR CORNER WIRING TABLE)
+# 2. HARDWARE PINOUT & PARENT CONFIGURATION
 # =========================================================================
-# Bottom-Left (Pins 18-20): Parent 1 & Parent 2 Pushbuttons (sharing GND Pin 18)
 PARENTS = {
     "parent_1": {
-        "name": "Mason",
-        "pin": 14,          # Physical Pin 19 (GP14)
-        "api_token": "YOUR_PARENT_1_API_TOKEN",
-        "tag": "fed-by-mason"
+        "name": env.get("PARENT_1_NAME", "Parent 1"),
+        "pin": int(env.get("PARENT_1_PIN", "14")),
+        "api_token": env.get("PARENT_1_TOKEN", ""),
+        "tag": env.get("PARENT_1_TAG", "fed-by-parent-1")
     },
     "parent_2": {
-        "name": "Brenda",
-        "pin": 15,          # Physical Pin 20 (GP15)
-        "api_token": "YOUR_PARENT_2_API_TOKEN",
-        "tag": "fed-by-brenda"
+        "name": env.get("PARENT_2_NAME", "Parent 2"),
+        "pin": int(env.get("PARENT_2_PIN", "15")),
+        "api_token": env.get("PARENT_2_TOKEN", ""),
+        "tag": env.get("PARENT_2_TAG", "fed-by-parent-2")
     }
 }
+
 
 # Bottom-Right (Pins 21-24): Rotary Encoder (with GND on Pin 23, + on Pin 36)
 ENC_CLK_PIN = 16            # Physical Pin 21 (GP16)
@@ -165,12 +178,10 @@ def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
     # 2. Center Giant Ounces Readout
     oz_str = format_oz(amount_oz)
     if len(oz_str) <= 4:
-        # "4.25" at 3x (96px) + "oz" at 1x (16px) = 114px total
         num_scale = 3
         unit_scale = 1
         unit_y = 33
     else:
-        # "10.25" at 2x (80px) + "oz" at 2x (32px) = 114px total
         num_scale = 2
         unit_scale = 2
         unit_y = 22
@@ -230,8 +241,17 @@ def draw_modal(title, big_line, sub_line="", progress=None):
     oled.show()
 
 
+def halt_on_error(title, big_line, sub_line):
+    """Locks the device on an error screen so it will not proceed to the main screen."""
+    print(f"FATAL CONFIG ERROR: {title} | {big_line} | {sub_line}")
+    draw_modal(title, big_line, sub_line, progress=None)
+    while True:
+        led.toggle()
+        time.sleep(0.3)
+
+
 # =========================================================================
-# 6. POWER MANAGEMENT & WIFI
+# 6. POWER MANAGEMENT, WIFI & STARTUP CONFIG CHECK
 # =========================================================================
 def disable_wifi():
     try:
@@ -259,7 +279,8 @@ def wake_from_sleep_mode():
     oled.poweron()
 
 
-def connect_wifi(parent_name="", amount_oz=0.0):
+def connect_wifi():
+    """Connects to Wi-Fi without displaying any ounce numbers."""
     global ntp_synced
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
@@ -276,9 +297,9 @@ def connect_wifi(parent_name="", amount_oz=0.0):
         led.toggle()
         step += 1
         draw_modal(
-            title="CONNECTING WIFI",
-            big_line=f"{format_oz(amount_oz)} oz",
-            sub_line=f"Parent: {parent_name}",
+            title="CONNECTING",
+            big_line="WIFI...",
+            sub_line=WIFI_SSID[:16],
             progress=(step / 12.0) % 1.0
         )
         time.sleep(0.4)
@@ -297,6 +318,47 @@ def connect_wifi(parent_name="", amount_oz=0.0):
         if ENABLE_CPU_UNDERCLOCK:
             disable_wifi()
         return False
+
+
+def verify_startup_config():
+    """
+    Tests Wi-Fi, Server URL, Child ID, and both Parent API tokens on boot.
+    If any check fails (400, 401, 403, 404, or unreachable), halts on error screen.
+    """
+    if not connect_wifi():
+        halt_on_error("WIFI ERROR", "NO WIFI", "Check SSID/Pass")
+
+    draw_modal("STARTUP CHECK", "API...", "Checking config", progress=0.5)
+
+    # Verify each parent's token and the CHILD_ID against /api/children/{CHILD_ID}/
+    url = f"{BABY_BUDDY_BASE_URL}/api/children/{CHILD_ID}/"
+
+    for key, parent in PARENTS.items():
+        headers = {
+            "Authorization": f"Token {parent['api_token']}",
+            "Accept": "application/json"
+        }
+        response = None
+        try:
+            response = urequests.get(url, headers=headers)
+            status = response.status_code
+            if status != 200:
+                print(f"Config Error for {parent['name']} (HTTP {status}):", response.text)
+                if status in (401, 403):
+                    halt_on_error("CONFIG ERROR", f"HTTP {status}", f"Bad Token:{parent['name'][:6]}")
+                elif status == 404:
+                    halt_on_error("CONFIG ERROR", "HTTP 404", f"Bad Child ID:{CHILD_ID}")
+                else:
+                    halt_on_error("CONFIG ERROR", f"HTTP {status}", "Check Config")
+        except Exception as e:
+            print("Startup API connection failed:", e)
+            halt_on_error("CONFIG ERROR", "UNREACH", "Check Base URL")
+        finally:
+            if response:
+                response.close()
+
+    draw_modal("STARTUP CHECK", "OK!", "Config Verified", progress=1.0)
+    time.sleep(1.2)
 
 
 def any_button_pressed():
@@ -325,7 +387,7 @@ def format_iso_time(epoch_secs):
 def submit_bottle_feeding(parent_key, amount_oz, feed_type):
     parent = PARENTS[parent_key]
 
-    if not connect_wifi(parent["name"], amount_oz):
+    if not connect_wifi():
         draw_modal("WIFI FAILED", "NO NET", "Check Router", progress=0.0)
         time.sleep(3)
         return False
@@ -372,8 +434,8 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type):
             time.sleep(2.0)
         else:
             print("API Error:", response.status_code, response.text)
-            draw_modal("API ERROR", f"ERR {response.status_code}", "Check API Token")
-            time.sleep(3)
+            # Halt on 400/error so you can see the failure rather than returning to main screen
+            halt_on_error("API ERROR", f"ERR {response.status_code}", "Check Tag/Config")
     except Exception as e:
         print("Request Exception:", e)
         draw_modal("SERVER ERROR", "OFFLINE", "Cannot reach API")
@@ -399,8 +461,8 @@ def main():
     last_epoch = None
     screen_awake = True
 
-    draw_modal("STARTING UP", "SYNC...", "Connecting WiFi", progress=0.4)
-    connect_wifi("System", DEFAULT_OZ)
+    # Run startup verification (halts here if Wi-Fi, URL, Child ID, or Tokens fail)
+    verify_startup_config()
     if ENABLE_CPU_UNDERCLOCK:
         disable_wifi()
 
