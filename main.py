@@ -23,7 +23,7 @@ try:
 except OSError:
     print("WARNING: .env file not found on board!")
 
-ENABLE_CPU_UNDERCLOCK = False
+ENABLE_CPU_UNDERCLOCK = True
 
 WIFI_SSID = env.get("WIFI_SSID", "")
 WIFI_PASSWORD = env.get("WIFI_PASSWORD", "")
