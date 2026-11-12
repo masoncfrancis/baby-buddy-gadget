@@ -5,7 +5,7 @@ import time
 import ntptime
 import machine
 import framebuf
-from machine import Pin, I2C
+from machine import Pin, I2C, ADC
 from ssd1306 import SSD1306_I2C
 
 
@@ -76,8 +76,10 @@ MAX_OZ = 12.00
 DEFAULT_OZ = 4.00
 DEFAULT_DURATION_MIN = 10  # Logs feeding start as 10 mins prior to submit
 
-DEBOUNCE_MS = 200
-SLEEP_TIMEOUT_MS = 30000  # Screen turns off after 30 seconds of inactivity
+DEBOUNCE_MS = 180
+LONG_PRESS_MS = 700           # Hold knob for 0.7s in any menu to cancel back to idle
+SLEEP_TIMEOUT_MS = 20000      # Turn off OLED & sleep after 20s of inactivity
+ERROR_SLEEP_TIMEOUT_MS = 60000 # Turn off OLED if stuck on error screen for 60s
 
 FREQ_ACTIVE = 125_000_000
 FREQ_IDLE = 24_000_000
@@ -103,6 +105,7 @@ sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
 
 wlan = network.WLAN(network.STA_IF)
 ntp_synced = False
+cached_batt_label = "--%"
 
 # --- ROTARY ENCODER INTERRUPT HANDLER ---
 encoder_delta = 0
@@ -126,6 +129,29 @@ def rotary_isr(pin):
 
 
 clk_pin.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=rotary_isr)
+
+
+def update_battery_status():
+    """
+    Reads VSYS voltage via internal ADC(29).
+    Best called when Wi-Fi is idle/disabled so GP25/GP29 SPI CS doesn't interfere.
+    """
+    global cached_batt_label
+    try:
+        Pin(29, Pin.IN)
+        adc = ADC(29)
+        raw = sum(adc.read_u16() for _ in range(5)) / 5
+        vsys = (raw * 3.3 / 65535) * 3.0
+
+        # USB power puts ~4.7V-5.0V on VSYS; LiPo is 4.20V (100%) down to 3.30V (0%)
+        if vsys > 4.45:
+            cached_batt_label = "USB"
+        else:
+            pct = int(max(0, min(100, (vsys - 3.30) / (4.15 - 3.30) * 100)))
+            cached_batt_label = f"{pct}%"
+    except Exception as e:
+        print("Battery ADC read error:", e)
+    return cached_batt_label
 
 
 # =========================================================================
@@ -179,58 +205,49 @@ def format_elapsed(last_epoch):
 
 
 def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
+    """Main Idle Screen: Displays the latest feeding prominently."""
     oled.poweron()
     oled.fill(0)
 
-    # 1. Top Inverted Header Bar (Milk Type + PUSH hint)
-    feed_label = FEED_TYPES[type_idx]["label"]
+    # 1. Top Inverted Header Bar ("LAST FEEDING" + Live Battery Badge)
     oled.fill_rect(0, 0, 128, 12, 1)
-    oled.text(feed_label, 3, 2, 0)
-    oled.fill_rect(98, 1, 29, 10, 0)
-    oled.text("PUSH", 101, 2, 1)
+    oled.text("LAST FEEDING", 3, 2, 0)
 
-    # 2. Center Giant Ounces Readout
-    oz_str = format_oz(amount_oz)
-    if len(oz_str) <= 4:
-        num_scale = 3
-        unit_scale = 1
-        unit_y = 33
-    else:
-        num_scale = 2
-        unit_scale = 2
-        unit_y = 22
+    badge_w = len(cached_batt_label) * 8 + 4
+    badge_x = 127 - badge_w
+    oled.fill_rect(badge_x, 1, badge_w, 10, 0)
+    oled.text(cached_batt_label, badge_x + 2, 2, 1)
 
+    if last_epoch is None:
+        draw_centered_scaled_text("NONE", 22, scale=2, color=1)
+        oled.hline(0, 52, 128, 1)
+        draw_centered_text("PUSH TO LOG", 55, 1)
+        oled.show()
+        return
+
+    # 2. Center Giant Ounces Readout of the LAST feeding
+    oz_str = format_oz(last_oz)
+    num_scale = 2
     num_width = len(oz_str) * (8 * num_scale)
-    unit_width = 2 * (8 * unit_scale)
-    total_w = num_width + 2 + unit_width
+    unit_width = 2 * 8
+    total_w = num_width + 4 + unit_width
     start_x = (128 - total_w) // 2
 
-    if amount_oz > MIN_OZ:
-        oled.text("<", 0, 26, 1)
-    if amount_oz < MAX_OZ:
-        oled.text(">", 120, 26, 1)
+    draw_scaled_text(oz_str, start_x, 16, scale=num_scale, color=1)
+    oled.text("oz", start_x + num_width + 4, 24, 1)
 
-    draw_scaled_text(oz_str, start_x, 18, scale=num_scale, color=1)
-    draw_scaled_text("oz", start_x + num_width + 2, unit_y, scale=unit_scale, color=1)
-
-    # 3. Slim Progress / Fill Bar
-    oled.rect(10, 46, 108, 4, 1)
-    fill_ratio = (amount_oz - MIN_OZ) / (MAX_OZ - MIN_OZ)
-    fill_w = int(104 * max(0.0, min(1.0, fill_ratio)))
-    if fill_w > 0:
-        oled.fill_rect(12, 47, fill_w, 2, 1)
-
-    # 4. Bottom Footer (Last Feeding + Live Elapsed Time)
-    oled.hline(0, 53, 128, 1)
-    if last_epoch is None:
-        oled.text("Last: None yet", 8, 56, 1)
+    # 3. Elapsed Time & Clock Time of Last Feeding
+    elapsed_str = format_elapsed(last_epoch)
+    clock_str = format_clock(last_epoch)
+    if last_parent:
+        sub_line = f"{elapsed_str} ({last_parent[:6]})"
     else:
-        elapsed_str = format_elapsed(last_epoch)
-        if last_parent:
-            footer = f"{last_parent[0]}:{format_oz(last_oz)} {elapsed_str}"
-        else:
-            footer = f"Last:{format_oz(last_oz)} {elapsed_str}"
-        oled.text(footer[:16], 2, 56, 1)
+        sub_line = f"{elapsed_str} ({clock_str})"
+    draw_centered_text(sub_line[:16], 38, 1)
+
+    # 4. Bottom Footer Prompt
+    oled.hline(0, 52, 128, 1)
+    draw_centered_text("PUSH TO LOG NEW", 55, 1)
 
     oled.show()
 
@@ -334,18 +351,50 @@ def draw_modal(title, big_line, sub_line="", progress=None):
     if progress is not None:
         oled.rect(14, 53, 100, 6, 1)
         fill_w = int(96 * max(0.0, min(1.0, progress)))
-        oled.fill_rect(16, 55, fill_w, 2, 1)
+        if fill_w > 0:
+            oled.fill_rect(16, 55, fill_w, 2, 1)
 
     oled.show()
 
 
 def halt_on_error(title, big_line, sub_line):
-    """Locks the device on an error screen so it will not proceed to the main screen."""
+    """
+    Locks the device on an error screen, but powers down Wi-Fi and turns off
+    the OLED after 60s so an error never drains the LiPo battery overnight.
+    """
+    global encoder_delta
     print(f"FATAL CONFIG ERROR: {title} | {big_line} | {sub_line}")
+    if ENABLE_CPU_UNDERCLOCK:
+        disable_wifi()
     draw_modal(title, big_line, sub_line, progress=None)
+
+    start_ms = time.ticks_ms()
+    screen_on = True
     while True:
-        led.toggle()
-        time.sleep(0.3)
+        if screen_on and time.ticks_diff(time.ticks_ms(), start_ms) > ERROR_SLEEP_TIMEOUT_MS:
+            oled.poweroff()
+            led.off()
+            if ENABLE_CPU_UNDERCLOCK:
+                machine.freq(FREQ_IDLE)
+            screen_on = False
+
+        if not screen_on:
+            if any_button_pressed() or encoder_delta != 0:
+                encoder_delta = 0
+                if ENABLE_CPU_UNDERCLOCK:
+                    machine.freq(FREQ_ACTIVE)
+                draw_modal(title, big_line, sub_line, progress=None)
+                wait_for_all_released()
+                start_ms = time.ticks_ms()
+                screen_on = True
+            else:
+                if ENABLE_CPU_UNDERCLOCK:
+                    machine.lightsleep(100)
+                else:
+                    time.sleep_ms(100)
+        else:
+            led.toggle()
+            time.sleep_ms(300)
 
 
 # =========================================================================
@@ -360,6 +409,7 @@ def disable_wifi():
         wlan.deinit()
     except Exception:
         pass
+    update_battery_status()
 
 
 def enter_sleep_mode():
@@ -374,6 +424,7 @@ def enter_sleep_mode():
 def wake_from_sleep_mode():
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
+    update_battery_status()
     oled.poweron()
 
 
@@ -392,11 +443,19 @@ def sync_clock():
 
 
 def connect_wifi():
-    """Connects to Wi-Fi without displaying any ounce numbers."""
-    global ntp_synced
+    """Connects to Wi-Fi cleanly even after wlan.deinit()."""
+    global wlan, ntp_synced
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
+
+    wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    try:
+        pm_perf = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11140)
+        wlan.config(pm=pm_perf)
+    except Exception:
+        pass
+
     if wlan.isconnected():
         led.on()
         if not ntp_synced:
@@ -617,51 +676,60 @@ def main():
     type_idx = 0
     start_epoch = 0
     selected_parent_key = "parent_1"
-    wizard_state = "type"
+    wizard_state = "idle"
     last_parent = ""
     last_oz = 0.0
     last_epoch = None
     screen_awake = True
-    sw_pressed = False
 
-    # Run startup verification (halts here if Wi-Fi, URL, Child ID, or Tokens fail)
+    sw_pressed = False
+    sw_press_start_ms = 0
+    sw_long_handled = False
+
+    # 1. Verify config & sync NTP while Wi-Fi is active on boot
     verify_startup_config()
     sync_clock()
-    if ENABLE_CPU_UNDERCLOCK:
-        disable_wifi()
 
+    # 2. Fetch latest feeding BEFORE disabling Wi-Fi
     latest_feeding = fetch_latest_feeding()
     if latest_feeding:
         last_oz, last_epoch = latest_feeding
-        draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
-        time.sleep(3)
 
-    draw_type_menu(type_idx)
+    # 3. Power down Wi-Fi & sample battery voltage while radio is quiet
+    if ENABLE_CPU_UNDERCLOCK:
+        disable_wifi()
+    else:
+        update_battery_status()
+
+    # Start on the idle dashboard (shows latest feeding & battery %)
+    draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
     last_activity_ms = time.ticks_ms()
     last_footer_refresh_ms = time.ticks_ms()
 
     while True:
         now = time.ticks_ms()
 
-        # 1. Turn off OLED after 30s of inactivity while idle
-        if (
-            wizard_state == "idle"
-            and screen_awake
-            and time.ticks_diff(now, last_activity_ms) >= SLEEP_TIMEOUT_MS
-        ):
+        # 1. Sleep after 20s of inactivity on ANY screen (prevents battery drain)
+        if screen_awake and time.ticks_diff(now, last_activity_ms) >= SLEEP_TIMEOUT_MS:
             enter_sleep_mode()
             screen_awake = False
+            wizard_state = "idle"
+            sw_pressed = False
+            sw_long_handled = False
 
-        # 2. Asleep loop: wake on knob turn or encoder press without acting
+        # 2. Asleep loop: wake instantly on knob turn or click without turning on Wi-Fi
         if not screen_awake:
             if encoder_delta != 0 or any_button_pressed():
                 encoder_delta = 0
                 wake_from_sleep_mode()
-                connect_wifi()
-                sync_clock()
                 screen_awake = True
+                wizard_state = "idle"
                 draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
+                wait_for_all_released()
+                sw_pressed = False
+                sw_long_handled = False
                 last_activity_ms = time.ticks_ms()
+                last_footer_refresh_ms = time.ticks_ms()
             else:
                 if ENABLE_CPU_UNDERCLOCK:
                     machine.lightsleep(50)
@@ -669,11 +737,12 @@ def main():
                     time.sleep_ms(50)
             continue
 
-        # 3. Refresh the "Xm ago" footer every 15 seconds while awake
+        # 3. Refresh the "Xm ago" footer & battery % every 15 seconds while idle
         if (
             wizard_state == "idle"
             and time.ticks_diff(now, last_footer_refresh_ms) >= 15000
         ):
+            update_battery_status()
             draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
             last_footer_refresh_ms = now
 
@@ -681,7 +750,10 @@ def main():
         if encoder_delta != 0:
             steps = encoder_delta
             encoder_delta = 0
-            if wizard_state == "type":
+            if wizard_state == "idle":
+                wizard_state = "type"
+                draw_type_menu(type_idx)
+            elif wizard_state == "type":
                 type_idx = (type_idx + steps) % len(FEED_TYPES)
                 draw_type_menu(type_idx)
             elif wizard_state == "amount":
@@ -692,9 +764,6 @@ def main():
                     amount_oz = MAX_OZ
                 draw_amount_menu(amount_oz)
             elif wizard_state == "start":
-                # Accept either direction only when resulting timestamp is
-                # not in the future. This lets clockwise catch up as time
-                # advances, while still preventing future start times.
                 candidate_epoch = start_epoch + steps * 15 * 60
                 if candidate_epoch <= time.time():
                     start_epoch = candidate_epoch
@@ -707,55 +776,79 @@ def main():
                 draw_parent_menu(selected_parent_key)
             last_activity_ms = time.ticks_ms()
 
-        # 5. Encoder Push-Button
+        # 5. Encoder Push-Button (Short Click = Advance, Long Hold = Cancel)
         sw_is_pressed = sw_pin.value() == 0
-        if sw_is_pressed and not sw_pressed:
-            sw_pressed = True
 
-            # Process press immediately. Waiting for release caused the
-            # menu to appear frozen on hardware with a noisy switch.
-            if wizard_state == "idle":
-                wizard_state = "type"
-                draw_type_menu(type_idx)
-            elif wizard_state == "type":
-                wizard_state = "amount"
-                draw_amount_menu(amount_oz)
-            elif wizard_state == "amount":
-                connect_wifi()
-                sync_clock()
-                start_epoch = time.time()
-                local_epoch = start_epoch + TIMEZONE_OFFSET_MINUTES * 60
-                start_time = time.localtime(local_epoch)
-                local_epoch -= (start_time[4] % 15) * 60 + start_time[5]
-                start_epoch = local_epoch - TIMEZONE_OFFSET_MINUTES * 60
-                wizard_state = "start"
-                draw_start_menu(start_epoch)
-            elif wizard_state == "start":
-                wizard_state = "parent"
-                draw_parent_menu(selected_parent_key)
-            elif wizard_state == "parent":
-                wizard_state = "confirm"
-                draw_summary(type_idx, amount_oz, start_epoch, selected_parent_key)
-            elif wizard_state == "confirm":
-                selected_type = FEED_TYPES[type_idx]
-                success = submit_bottle_feeding(
-                    selected_parent_key, amount_oz, selected_type, start_epoch
-                )
+        if sw_is_pressed:
+            if not sw_pressed:
+                # Button just pressed down: start hold timer
+                sw_pressed = True
+                sw_press_start_ms = now
+                sw_long_handled = False
+                last_activity_ms = now
+            elif not sw_long_handled and time.ticks_diff(now, sw_press_start_ms) >= LONG_PRESS_MS:
+                # Held past 700ms!
+                sw_long_handled = True
+                if wizard_state != "idle":
+                    # Cancel wizard from any step and return to main screen
+                    draw_modal("CANCELLED", "EXIT", "Back to main", progress=None)
+                    time.sleep_ms(600)
+                    wizard_state = "idle"
+                    draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
+                    wait_for_all_released()
+                    sw_pressed = False
+                    sw_long_handled = False
+                else:
+                    # If held while on idle screen, just enter the wizard normally
+                    wizard_state = "type"
+                    draw_type_menu(type_idx)
+                last_activity_ms = time.ticks_ms()
 
-                if success:
-                    last_parent = PARENTS[selected_parent_key]["name"]
-                    last_oz = amount_oz
-                    last_epoch = time.time()
-
-                wizard_state = "type"
-                draw_type_menu(type_idx)
-
-            last_activity_ms = time.ticks_ms()
         elif not sw_is_pressed and sw_pressed:
+            # Button released: if it wasn't a long press, process as a short click
+            hold_ms = time.ticks_diff(now, sw_press_start_ms)
             sw_pressed = False
+
+            if not sw_long_handled and hold_ms >= 30:  # 30ms glitch filter
+                if wizard_state == "idle":
+                    wizard_state = "type"
+                    draw_type_menu(type_idx)
+                elif wizard_state == "type":
+                    wizard_state = "amount"
+                    draw_amount_menu(amount_oz)
+                elif wizard_state == "amount":
+                    start_epoch = time.time()
+                    local_epoch = start_epoch + TIMEZONE_OFFSET_MINUTES * 60
+                    start_time = time.localtime(local_epoch)
+                    local_epoch -= (start_time[4] % 15) * 60 + start_time[5]
+                    start_epoch = local_epoch - TIMEZONE_OFFSET_MINUTES * 60
+                    wizard_state = "start"
+                    draw_start_menu(start_epoch)
+                elif wizard_state == "start":
+                    wizard_state = "parent"
+                    draw_parent_menu(selected_parent_key)
+                elif wizard_state == "parent":
+                    wizard_state = "confirm"
+                    draw_summary(type_idx, amount_oz, start_epoch, selected_parent_key)
+                elif wizard_state == "confirm":
+                    selected_type = FEED_TYPES[type_idx]
+                    success = submit_bottle_feeding(
+                        selected_parent_key, amount_oz, selected_type, start_epoch
+                    )
+
+                    if success:
+                        last_parent = PARENTS[selected_parent_key]["name"]
+                        last_oz = amount_oz
+                        last_epoch = time.time()
+
+                    wizard_state = "idle"
+                    draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
+
+                last_activity_ms = time.ticks_ms()
 
         time.sleep_ms(20)
 
 
 if __name__ == "__main__":
     main()
+    
