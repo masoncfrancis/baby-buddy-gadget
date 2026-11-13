@@ -74,7 +74,7 @@ MAX_OZ = 12.00
 DEFAULT_OZ = 4.00
 
 DEBOUNCE_MS = 180
-LONG_PRESS_MS = 700            # Hold knob 0.7s: Cancels in menu, or Syncs Wi-Fi on idle screen!
+LONG_PRESS_MS = 700            # Hold knob 0.7s: Refreshes on main screen, or Cancels in menu!
 SLEEP_TIMEOUT_MS = 20000       # Turn off OLED & sleep after 20s of inactivity
 AUTO_SYNC_INTERVAL_SEC = 14400 # Background re-sync on wake only if >4 hours since last sync
 ERROR_SLEEP_TIMEOUT_MS = 60000 # Turn off OLED if stuck on error screen for 60s
@@ -269,7 +269,7 @@ def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
     if last_epoch is None:
         draw_centered_scaled_text("NONE", 22, scale=2, color=1)
         oled.hline(0, 52, 128, 1)
-        draw_centered_text("PUSH TO LOG", 55, 1)
+        draw_centered_text("HOLD TO REFRESH", 55, 1)
         oled.show()
         return
 
@@ -285,19 +285,17 @@ def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
     oled.text("oz", start_x + num_width + 4, 24, 1)
 
     # 3. Elapsed Time + 12-Hour AM/PM Clock Time (Guaranteed to fit in 16 chars!)
-    # Example: "2h14m (10:30PM)" (15 chars) or "45m ago (3:15PM)" (16 chars)
     elapsed_str = format_elapsed(last_epoch)
     clock_str = format_clock(last_epoch)
     sub_line = f"{elapsed_str} ({clock_str})"
     if len(sub_line) > 16:
-        # Fallback if >99 hours: "102h (10:30PM)"
         diff_h = max(0, int((now_epoch() - last_epoch) // 3600))
         sub_line = f"{diff_h}h ago ({clock_str})"
     draw_centered_text(sub_line[:16], 38, 1)
 
-    # 4. Bottom Footer Prompt
+    # 4. Bottom Footer Prompt (Click = Log, Hold = Refresh Latest Feed)
     oled.hline(0, 52, 128, 1)
-    draw_centered_text("PUSH:LOG HOLD:UP", 55, 1)
+    draw_centered_text("CLK:LOG HOLD:REF", 55, 1)
 
     oled.show()
 
@@ -613,24 +611,40 @@ def fetch_latest_feeding():
             response.close()
 
 
-def refresh_from_server(last_parent, last_oz, last_epoch):
+def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
     """
     Connects to Wi-Fi, syncs NTP, fetches the latest feeding from Baby Buddy,
-    and powers Wi-Fi back down. Triggered by holding the knob on the idle screen
-    or automatically if >4 hours have passed since the last sync.
+    shows a confirmation toast, and powers Wi-Fi back down.
     """
+    draw_modal("REFRESHING", "LATEST...", "Connecting Wi-Fi", progress=0.25)
+
     if connect_wifi(sync_ntp=True):
-        draw_modal("SYNCING", "UPDATING", "Time & Last Feed", progress=0.75)
+        draw_modal("REFRESHING", "FETCHING", "Baby Buddy API", progress=0.75)
         latest = fetch_latest_feeding()
         if latest:
             last_oz, last_epoch, fetched_parent = latest
             if fetched_parent:
                 last_parent = fetched_parent
+            if show_toast:
+                draw_modal(
+                    "REFRESHED",
+                    "UPDATED!",
+                    f"{format_oz(last_oz)}oz ({format_clock(last_epoch)})",
+                    progress=1.0,
+                )
+                time.sleep_ms(900)
+        else:
+            if show_toast:
+                draw_modal("REFRESHED", "NO LOGS", "No feeds found", progress=1.0)
+                time.sleep_ms(900)
+
         if ENABLE_CPU_UNDERCLOCK:
             disable_wifi()
         else:
             update_battery_status()
     else:
+        draw_modal("WIFI FAILED", "NO NET", "Keep cached feed", progress=None)
+        time.sleep_ms(1200)
         update_battery_status()
 
     return last_parent, last_oz, last_epoch
@@ -832,7 +846,7 @@ def main():
                 # Only auto-connect Wi-Fi on wake if >4 hours since last sync
                 if (now_epoch() - _last_ntp_sync_epoch) >= AUTO_SYNC_INTERVAL_SEC:
                     last_parent, last_oz, last_epoch = refresh_from_server(
-                        last_parent, last_oz, last_epoch
+                        last_parent, last_oz, last_epoch, show_toast=False
                     )
                     encoder_delta = 0
 
@@ -887,7 +901,7 @@ def main():
                 draw_parent_menu(selected_parent_key)
             last_activity_ms = time.ticks_ms()
 
-        # 5. Encoder Push-Button (Short Click = Advance, Long Hold = Cancel or Manual Sync)
+        # 5. Encoder Push-Button (Short Click = Advance, Long Hold = Refresh on Main / Cancel in Menu)
         sw_is_pressed = sw_pin.value() == 0
 
         if sw_is_pressed:
@@ -899,13 +913,13 @@ def main():
             elif not sw_long_handled and time.ticks_diff(now, sw_press_start_ms) >= LONG_PRESS_MS:
                 sw_long_handled = True
                 if wizard_state != "idle":
-                    # Cancel wizard from any step and return to main screen
+                    # Cancel wizard from any menu step and return to main screen
                     draw_modal("CANCELLED", "EXIT", "Back to main", progress=None)
                     time.sleep_ms(600)
                 else:
-                    # Held on idle screen: manually sync time & latest feed from server!
+                    # Held on main screen: connect Wi-Fi, sync time & refresh latest feed!
                     last_parent, last_oz, last_epoch = refresh_from_server(
-                        last_parent, last_oz, last_epoch
+                        last_parent, last_oz, last_epoch, show_toast=True
                     )
                 encoder_delta = 0
                 wizard_state = "idle"
@@ -914,6 +928,7 @@ def main():
                 sw_pressed = False
                 sw_long_handled = False
                 last_activity_ms = time.ticks_ms()
+                last_footer_refresh_ms = time.ticks_ms()
 
         elif not sw_is_pressed and sw_pressed:
             hold_ms = time.ticks_diff(now, sw_press_start_ms)
