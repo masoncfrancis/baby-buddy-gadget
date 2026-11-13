@@ -35,7 +35,6 @@ try:
 except ValueError:
     TIMEZONE_OFFSET_MINUTES = 0
 
-# Safely convert integer fields from strings
 try:
     CHILD_ID = int(env.get("CHILD_ID", "1"))
 except ValueError:
@@ -57,28 +56,27 @@ PARENTS = {
     },
 }
 
-
 # Bottom-Right (Pins 21-24): Rotary Encoder (with GND on Pin 23, + on Pin 36)
 ENC_CLK_PIN = 16  # Physical Pin 21 (GP16)
-ENC_DT_PIN = 17  # Physical Pin 22 (GP17)
-ENC_SW_PIN = 18  # Physical Pin 24 (GP18)
+ENC_DT_PIN = 17   # Physical Pin 22 (GP17)
+ENC_SW_PIN = 18   # Physical Pin 24 (GP18)
 
-# Top-Left (Pins 6-8): OLED Display (with GND on Pin 8, VCC on Pin 36)
+# Top-Left (Pins 6-8): OLED Display (with GND on Pin 8, VDD on Pin 36)
 OLED_SDA_PIN = 4  # Physical Pin 6 (GP4)
 OLED_SCL_PIN = 5  # Physical Pin 7 (GP5)
 
 # =========================================================================
 # 3. FEEDING & UI SETTINGS
 # =========================================================================
-STEP_OZ = 0.25  # 0.25 oz per click of the knob
+STEP_OZ = 0.25
 MIN_OZ = 0.25
 MAX_OZ = 12.00
 DEFAULT_OZ = 4.00
-DEFAULT_DURATION_MIN = 10  # Logs feeding start as 10 mins prior to submit
 
 DEBOUNCE_MS = 180
-LONG_PRESS_MS = 700           # Hold knob for 0.7s in any menu to cancel back to idle
-SLEEP_TIMEOUT_MS = 20000      # Turn off OLED & sleep after 20s of inactivity
+LONG_PRESS_MS = 700            # Hold knob 0.7s: Cancels in menu, or Syncs Wi-Fi on idle screen!
+SLEEP_TIMEOUT_MS = 20000       # Turn off OLED & sleep after 20s of inactivity
+AUTO_SYNC_INTERVAL_SEC = 14400 # Background re-sync on wake only if >4 hours since last sync
 ERROR_SLEEP_TIMEOUT_MS = 60000 # Turn off OLED if stuck on error screen for 60s
 
 FREQ_ACTIVE = 125_000_000
@@ -91,7 +89,7 @@ FEED_TYPES = [
 ]
 
 # =========================================================================
-# 4. HARDWARE INITIALIZATION
+# 4. HARDWARE INITIALIZATION & CRYSTAL-LOCKED CLOCK
 # =========================================================================
 led = Pin("LED", Pin.OUT)
 
@@ -104,8 +102,37 @@ dt_pin = Pin(ENC_DT_PIN, Pin.IN, Pin.PULL_UP)
 sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
 
 wlan = network.WLAN(network.STA_IF)
-ntp_synced = False
 cached_batt_label = "--%"
+
+# --- HARDWARE CRYSTAL MONOTONIC CLOCK ---
+# Locks UTC time to the RP2040's 1MHz crystal timer (ticks_ms) so CPU underclocking
+# (24MHz <-> 125MHz) NEVER causes the clock to slow down or drift during sleep!
+_base_epoch = 0
+_base_ticks_ms = time.ticks_ms()
+_remainder_ms = 0
+_last_ntp_sync_epoch = 0
+
+
+def set_accurate_epoch(utc_epoch):
+    global _base_epoch, _base_ticks_ms, _remainder_ms, _last_ntp_sync_epoch
+    _base_epoch = int(utc_epoch)
+    _base_ticks_ms = time.ticks_ms()
+    _remainder_ms = 0
+    _last_ntp_sync_epoch = _base_epoch
+
+
+def now_epoch():
+    """Returns exact UTC epoch seconds immune to CPU frequency scaling."""
+    global _base_epoch, _base_ticks_ms, _remainder_ms
+    now_t = time.ticks_ms()
+    diff_ms = time.ticks_diff(now_t, _base_ticks_ms)
+    if diff_ms >= 1000:
+        total_ms = diff_ms + _remainder_ms
+        _base_epoch += total_ms // 1000
+        _remainder_ms = total_ms % 1000
+        _base_ticks_ms = now_t
+    return _base_epoch
+
 
 # --- ROTARY ENCODER INTERRUPT HANDLER ---
 encoder_delta = 0
@@ -143,7 +170,6 @@ def update_battery_status():
         raw = sum(adc.read_u16() for _ in range(5)) / 5
         vsys = (raw * 3.3 / 65535) * 3.0
 
-        # USB power puts ~4.7V-5.0V on VSYS; LiPo is 4.20V (100%) down to 3.30V (0%)
         if vsys > 4.45:
             cached_batt_label = "USB"
         else:
@@ -155,7 +181,7 @@ def update_battery_status():
 
 
 # =========================================================================
-# 5. GRAPHICAL UI HELPERS
+# 5. GRAPHICAL UI HELPERS & 12-HOUR AM/PM FORMATTERS
 # =========================================================================
 _char_buf = bytearray(8)
 _char_fb = framebuf.FrameBuffer(_char_buf, 8, 8, framebuf.MONO_VLSB)
@@ -187,25 +213,47 @@ def draw_centered_scaled_text(text, y, scale=2, color=1):
 
 
 def format_oz(val):
-    """Always shows 2 decimals (e.g. 4.00, 4.25) so numbers stay rock-steady."""
     return f"{val:.2f}"
 
 
+def format_clock_parts(epoch_secs):
+    """Returns ('H:MM', 'AM'/'PM') in 12-hour format."""
+    t = time.localtime(epoch_secs + TIMEZONE_OFFSET_MINUTES * 60)
+    hour24 = t[3]
+    minute = t[4]
+    ampm = "AM" if hour24 < 12 else "PM"
+    hour12 = hour24 % 12
+    if hour12 == 0:
+        hour12 = 12
+    return f"{hour12}:{minute:02d}", ampm
+
+
+def format_clock(epoch_secs):
+    """Returns compact 12-hour AM/PM string like '3:45PM' or '12:15AM'."""
+    time_str, ampm = format_clock_parts(epoch_secs)
+    return f"{time_str}{ampm}"
+
+
+def format_date(epoch_secs):
+    t = time.localtime(epoch_secs + TIMEZONE_OFFSET_MINUTES * 60)
+    return f"{t[0]:04d}-{t[1]:02d}-{t[2]:02d}"
+
+
 def format_elapsed(last_epoch):
-    """Returns a friendly elapsed string like '2h 14m ago' or 'Just now'."""
+    """Returns a compact elapsed string so '2h14m (12:45PM)' always fits in 16 chars."""
     if last_epoch is None:
         return "No logs yet"
-    diff_min = max(0, int((time.time() - last_epoch) // 60))
+    diff_min = max(0, int((now_epoch() - last_epoch) // 60))
     if diff_min < 1:
-        return "Just now"
+        return "Now"
     elif diff_min < 60:
         return f"{diff_min}m ago"
     else:
-        return f"{diff_min // 60}h {diff_min % 60}m ago"
+        return f"{diff_min // 60}h{diff_min % 60:02d}m"
 
 
 def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
-    """Main Idle Screen: Displays the latest feeding prominently."""
+    """Main Idle Screen: Always displays the latest feeding amount & 12-hour AM/PM time."""
     oled.poweron()
     oled.fill(0)
 
@@ -236,18 +284,20 @@ def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
     draw_scaled_text(oz_str, start_x, 16, scale=num_scale, color=1)
     oled.text("oz", start_x + num_width + 4, 24, 1)
 
-    # 3. Elapsed Time & Clock Time of Last Feeding
+    # 3. Elapsed Time + 12-Hour AM/PM Clock Time (Guaranteed to fit in 16 chars!)
+    # Example: "2h14m (10:30PM)" (15 chars) or "45m ago (3:15PM)" (16 chars)
     elapsed_str = format_elapsed(last_epoch)
     clock_str = format_clock(last_epoch)
-    if last_parent:
-        sub_line = f"{elapsed_str} ({last_parent[:6]})"
-    else:
-        sub_line = f"{elapsed_str} ({clock_str})"
+    sub_line = f"{elapsed_str} ({clock_str})"
+    if len(sub_line) > 16:
+        # Fallback if >99 hours: "102h (10:30PM)"
+        diff_h = max(0, int((now_epoch() - last_epoch) // 3600))
+        sub_line = f"{diff_h}h ago ({clock_str})"
     draw_centered_text(sub_line[:16], 38, 1)
 
     # 4. Bottom Footer Prompt
     oled.hline(0, 52, 128, 1)
-    draw_centered_text("PUSH TO LOG NEW", 55, 1)
+    draw_centered_text("PUSH:LOG HOLD:UP", 55, 1)
 
     oled.show()
 
@@ -298,30 +348,30 @@ def draw_amount_menu(amount_oz):
     oled.show()
 
 
-def format_clock(epoch_secs):
-    t = time.localtime(epoch_secs + TIMEZONE_OFFSET_MINUTES * 60)
-    return f"{t[3]:02d}:{t[4]:02d}"
-
-
-def format_date(epoch_secs):
-    t = time.localtime(epoch_secs + TIMEZONE_OFFSET_MINUTES * 60)
-    return f"{t[0]:04d}-{t[1]:02d}-{t[2]:02d}"
-
-
 def draw_start_menu(start_epoch):
-    """Shows the feeding start-time selection step."""
+    """Shows the feeding start-time selection step in 12-hour AM/PM format."""
     oled.poweron()
     oled.fill(0)
     oled.fill_rect(0, 0, 128, 13, 1)
     draw_centered_text("START TIME", 3, 0)
-    draw_centered_text(format_date(start_epoch), 17)
-    draw_centered_scaled_text(format_clock(start_epoch), 28, scale=2, color=1)
+    draw_centered_text(format_date(start_epoch), 16)
+
+    # Render '12:45' in 2x scale and 'PM' right beside it so it fits cleanly!
+    time_str, ampm = format_clock_parts(start_epoch)
+    num_w = len(time_str) * 16
+    ampm_w = 2 * 8
+    total_w = num_w + 4 + ampm_w
+    start_x = max(0, (128 - total_w) // 2)
+
+    draw_scaled_text(time_str, start_x, 28, scale=2, color=1)
+    oled.text(ampm, start_x + num_w + 4, 36, 1)
+
     draw_centered_text("TURN + PUSH", 55)
     oled.show()
 
 
 def draw_summary(type_idx, amount_oz, start_epoch, selected_parent_key):
-    """Shows feeding details before submission."""
+    """Shows feeding details before submission (with 12-hour AM/PM time)."""
     oled.poweron()
     oled.fill(0)
     oled.fill_rect(0, 0, 128, 13, 1)
@@ -388,10 +438,7 @@ def halt_on_error(title, big_line, sub_line):
                 start_ms = time.ticks_ms()
                 screen_on = True
             else:
-                if ENABLE_CPU_UNDERCLOCK:
-                    machine.lightsleep(100)
-                else:
-                    time.sleep_ms(100)
+                time.sleep_ms(100)
         else:
             led.toggle()
             time.sleep_ms(300)
@@ -413,6 +460,7 @@ def disable_wifi():
 
 
 def enter_sleep_mode():
+    now_epoch()  # Roll over elapsed seconds before sleeping
     oled.poweroff()
     if ENABLE_CPU_UNDERCLOCK:
         disable_wifi()
@@ -424,27 +472,30 @@ def enter_sleep_mode():
 def wake_from_sleep_mode():
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
+    now_epoch()  # Update monotonic clock immediately on wake
     update_battery_status()
     oled.poweron()
 
 
 def sync_clock():
-    """Synchronizes Pico clock with NTP when Wi-Fi is available."""
-    global ntp_synced
+    """Synchronizes Pico clock with NTP and locks it to the 1MHz crystal timer."""
     if not wlan.isconnected():
         return False
-    try:
-        ntptime.settime()
-        ntp_synced = True
-        return True
-    except Exception as e:
-        print("NTP sync failed:", e)
-        return False
+    ntptime.host = "pool.ntp.org"
+    for _ in range(3):
+        try:
+            ntptime.settime()
+            set_accurate_epoch(time.time())
+            return True
+        except Exception as e:
+            print("NTP sync attempt failed:", e)
+            time.sleep_ms(250)
+    return False
 
 
-def connect_wifi():
+def connect_wifi(sync_ntp=True):
     """Connects to Wi-Fi cleanly even after wlan.deinit()."""
-    global wlan, ntp_synced
+    global wlan
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
 
@@ -458,7 +509,7 @@ def connect_wifi():
 
     if wlan.isconnected():
         led.on()
-        if not ntp_synced:
+        if sync_ntp:
             sync_clock()
         return True
 
@@ -480,7 +531,7 @@ def connect_wifi():
 
     if wlan.isconnected():
         led.on()
-        if not ntp_synced:
+        if sync_ntp:
             sync_clock()
         return True
     else:
@@ -489,18 +540,112 @@ def connect_wifi():
         return False
 
 
+def parse_iso_to_utc_epoch(iso_str):
+    """
+    Parses Baby Buddy ISO-8601 timestamp (e.g. '2026-11-13T18:10:00Z' or
+    '2026-11-13T13:10:00-05:00') into accurate UTC epoch seconds.
+    """
+    date_part, rest = iso_str.split("T")
+    time_part = rest[:8]
+
+    tz_offset_sec = 0
+    tz_part = rest[8:]
+    if "." in tz_part:
+        for i, ch in enumerate(tz_part):
+            if ch in ("+", "-", "Z"):
+                tz_part = tz_part[i:]
+                break
+
+    if tz_part.startswith("+") or tz_part.startswith("-"):
+        sign = 1 if tz_part[0] == "+" else -1
+        tz_clean = tz_part[1:].replace(":", "")
+        if len(tz_clean) >= 4:
+            tz_h = int(tz_clean[:2])
+            tz_m = int(tz_clean[2:4])
+            tz_offset_sec = sign * (tz_h * 3600 + tz_m * 60)
+
+    date_values = [int(v) for v in date_part.split("-")]
+    time_values = [int(v) for v in time_part.split(":")]
+    raw_epoch = time.mktime(tuple(date_values + time_values + [0, 0]))
+    return raw_epoch - tz_offset_sec
+
+
+def fetch_latest_feeding():
+    """Returns latest feeding (amount_oz, utc_epoch, parent_name), or None if unavailable."""
+    parent = PARENTS["parent_1"]
+    url = (
+        f"{BABY_BUDDY_BASE_URL}/api/feedings/"
+        f"?child={CHILD_ID}&ordering=-end&limit=1"
+    )
+    headers = {
+        "Authorization": f"Token {parent['api_token']}",
+        "Accept": "application/json",
+    }
+    response = None
+    try:
+        response = urequests.get(url, headers=headers)
+        if response.status_code != 200:
+            print("Latest feeding lookup failed:", response.status_code)
+            return None
+
+        results = ujson.loads(response.text).get("results", [])
+        if not results:
+            return None
+
+        feeding = results[0]
+        end_text = feeding.get("end", "")
+        epoch = parse_iso_to_utc_epoch(end_text)
+
+        matched_parent = ""
+        feed_tags = feeding.get("tags", [])
+        if isinstance(feed_tags, list):
+            for p_info in PARENTS.values():
+                if p_info["tag"] in feed_tags:
+                    matched_parent = p_info["name"]
+                    break
+
+        return float(feeding.get("amount", 0)), epoch, matched_parent
+    except Exception as e:
+        print("Latest feeding lookup error:", e)
+        return None
+    finally:
+        if response:
+            response.close()
+
+
+def refresh_from_server(last_parent, last_oz, last_epoch):
+    """
+    Connects to Wi-Fi, syncs NTP, fetches the latest feeding from Baby Buddy,
+    and powers Wi-Fi back down. Triggered by holding the knob on the idle screen
+    or automatically if >4 hours have passed since the last sync.
+    """
+    if connect_wifi(sync_ntp=True):
+        draw_modal("SYNCING", "UPDATING", "Time & Last Feed", progress=0.75)
+        latest = fetch_latest_feeding()
+        if latest:
+            last_oz, last_epoch, fetched_parent = latest
+            if fetched_parent:
+                last_parent = fetched_parent
+        if ENABLE_CPU_UNDERCLOCK:
+            disable_wifi()
+        else:
+            update_battery_status()
+    else:
+        update_battery_status()
+
+    return last_parent, last_oz, last_epoch
+
+
 def verify_startup_config():
     """
     Tests Wi-Fi, Server URL, Child ID, and both Parent API tokens on boot.
     If any check fails (400, 401, 403, 404, or unreachable), halts on error screen.
     """
-    if not connect_wifi():
+    if not connect_wifi(sync_ntp=True):
         halt_on_error("WIFI ERROR", "NO WIFI", "Check Config")
 
     draw_modal("STARTUP CHECK", "API...", "Checking config", progress=0.5)
 
-    # Baby Buddy child detail endpoints use the child's slug, while feeding
-    # payloads use the numeric child ID.
     if not CHILD_SLUG:
         halt_on_error("CONFIG ERROR", "NO CHILD SLUG", "Set CHILD_SLUG")
     url = f"{BABY_BUDDY_BASE_URL}/api/children/{CHILD_SLUG}/"
@@ -541,44 +686,6 @@ def verify_startup_config():
     time.sleep(1.2)
 
 
-def fetch_latest_feeding():
-    """Returns latest feeding amount and epoch, or None if unavailable."""
-    parent = PARENTS["parent_1"]
-    url = (
-        f"{BABY_BUDDY_BASE_URL}/api/feedings/"
-        f"?child={CHILD_ID}&ordering=-end&limit=1"
-    )
-    headers = {
-        "Authorization": f"Token {parent['api_token']}",
-        "Accept": "application/json",
-    }
-    response = None
-    try:
-        response = urequests.get(url, headers=headers)
-        if response.status_code != 200:
-            print("Latest feeding lookup failed:", response.status_code)
-            return None
-
-        results = ujson.loads(response.text).get("results", [])
-        if not results:
-            return None
-
-        feeding = results[0]
-        end_text = feeding.get("end", "")
-        # Ignore fractional seconds and timezone suffix; device clock is UTC.
-        date_part, time_part = end_text[:19].split("T")
-        date_values = [int(value) for value in date_part.split("-")]
-        time_values = [int(value) for value in time_part.split(":")[:3]]
-        epoch = time.mktime(tuple(date_values + time_values + [0, 0]))
-        return float(feeding.get("amount", 0)), epoch
-    except Exception as e:
-        print("Latest feeding lookup error:", e)
-        return None
-    finally:
-        if response:
-            response.close()
-
-
 def any_button_pressed():
     return sw_pin.value() == 0
 
@@ -593,7 +700,6 @@ def wait_for_all_released():
 # 7. API SUBMISSION
 # =========================================================================
 def format_iso_time(epoch_secs):
-    # Baby Buddy expects UTC timestamps marked with Z.
     t = time.gmtime(epoch_secs)
     return f"{t[0]:04d}-{t[1]:02d}-{t[2]:02d}T{t[3]:02d}:{t[4]:02d}:{t[5]:02d}Z"
 
@@ -601,7 +707,7 @@ def format_iso_time(epoch_secs):
 def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
     parent = PARENTS[parent_key]
 
-    if not connect_wifi():
+    if not connect_wifi(sync_ntp=True):
         draw_modal("WIFI FAILED", "NO NET", "Check Router", progress=0.0)
         time.sleep(3)
         return False
@@ -613,8 +719,7 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
         progress=0.75,
     )
 
-    end_epoch = time.time()
-    # Never submit a start time in the future if submission is delayed.
+    end_epoch = now_epoch()
     if start_epoch > end_epoch:
         start_epoch = end_epoch
 
@@ -650,7 +755,6 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
             time.sleep(2.0)
         else:
             print("API Error:", response.status_code, response.text)
-            # Halt on 400/error so you can see the failure rather than returning to main screen
             halt_on_error(
                 "API ERROR", f"ERR {response.status_code}", "Check Tag/Config"
             )
@@ -688,12 +792,13 @@ def main():
 
     # 1. Verify config & sync NTP while Wi-Fi is active on boot
     verify_startup_config()
-    sync_clock()
 
     # 2. Fetch latest feeding BEFORE disabling Wi-Fi
     latest_feeding = fetch_latest_feeding()
     if latest_feeding:
-        last_oz, last_epoch = latest_feeding
+        last_oz, last_epoch, fetched_parent = latest_feeding
+        if fetched_parent:
+            last_parent = fetched_parent
 
     # 3. Power down Wi-Fi & sample battery voltage while radio is quiet
     if ENABLE_CPU_UNDERCLOCK:
@@ -708,6 +813,7 @@ def main():
 
     while True:
         now = time.ticks_ms()
+        now_epoch()  # Keep crystal-locked epoch counter updated
 
         # 1. Sleep after 20s of inactivity on ANY screen (prevents battery drain)
         if screen_awake and time.ticks_diff(now, last_activity_ms) >= SLEEP_TIMEOUT_MS:
@@ -717,11 +823,19 @@ def main():
             sw_pressed = False
             sw_long_handled = False
 
-        # 2. Asleep loop: wake instantly on knob turn or click without turning on Wi-Fi
+        # 2. Asleep loop: wake INSTANTLY using the crystal-locked clock
         if not screen_awake:
             if encoder_delta != 0 or any_button_pressed():
                 encoder_delta = 0
                 wake_from_sleep_mode()
+
+                # Only auto-connect Wi-Fi on wake if >4 hours since last sync
+                if (now_epoch() - _last_ntp_sync_epoch) >= AUTO_SYNC_INTERVAL_SEC:
+                    last_parent, last_oz, last_epoch = refresh_from_server(
+                        last_parent, last_oz, last_epoch
+                    )
+                    encoder_delta = 0
+
                 screen_awake = True
                 wizard_state = "idle"
                 draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
@@ -731,10 +845,7 @@ def main():
                 last_activity_ms = time.ticks_ms()
                 last_footer_refresh_ms = time.ticks_ms()
             else:
-                if ENABLE_CPU_UNDERCLOCK:
-                    machine.lightsleep(50)
-                else:
-                    time.sleep_ms(50)
+                time.sleep_ms(50)
             continue
 
         # 3. Refresh the "Xm ago" footer & battery % every 15 seconds while idle
@@ -765,7 +876,7 @@ def main():
                 draw_amount_menu(amount_oz)
             elif wizard_state == "start":
                 candidate_epoch = start_epoch + steps * 15 * 60
-                if candidate_epoch <= time.time():
+                if candidate_epoch <= now_epoch():
                     start_epoch = candidate_epoch
                 draw_start_menu(start_epoch)
             elif wizard_state == "parent":
@@ -776,36 +887,35 @@ def main():
                 draw_parent_menu(selected_parent_key)
             last_activity_ms = time.ticks_ms()
 
-        # 5. Encoder Push-Button (Short Click = Advance, Long Hold = Cancel)
+        # 5. Encoder Push-Button (Short Click = Advance, Long Hold = Cancel or Manual Sync)
         sw_is_pressed = sw_pin.value() == 0
 
         if sw_is_pressed:
             if not sw_pressed:
-                # Button just pressed down: start hold timer
                 sw_pressed = True
                 sw_press_start_ms = now
                 sw_long_handled = False
                 last_activity_ms = now
             elif not sw_long_handled and time.ticks_diff(now, sw_press_start_ms) >= LONG_PRESS_MS:
-                # Held past 700ms!
                 sw_long_handled = True
                 if wizard_state != "idle":
                     # Cancel wizard from any step and return to main screen
                     draw_modal("CANCELLED", "EXIT", "Back to main", progress=None)
                     time.sleep_ms(600)
-                    wizard_state = "idle"
-                    draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
-                    wait_for_all_released()
-                    sw_pressed = False
-                    sw_long_handled = False
                 else:
-                    # If held while on idle screen, just enter the wizard normally
-                    wizard_state = "type"
-                    draw_type_menu(type_idx)
+                    # Held on idle screen: manually sync time & latest feed from server!
+                    last_parent, last_oz, last_epoch = refresh_from_server(
+                        last_parent, last_oz, last_epoch
+                    )
+                encoder_delta = 0
+                wizard_state = "idle"
+                draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
+                wait_for_all_released()
+                sw_pressed = False
+                sw_long_handled = False
                 last_activity_ms = time.ticks_ms()
 
         elif not sw_is_pressed and sw_pressed:
-            # Button released: if it wasn't a long press, process as a short click
             hold_ms = time.ticks_diff(now, sw_press_start_ms)
             sw_pressed = False
 
@@ -817,7 +927,7 @@ def main():
                     wizard_state = "amount"
                     draw_amount_menu(amount_oz)
                 elif wizard_state == "amount":
-                    start_epoch = time.time()
+                    start_epoch = now_epoch()
                     local_epoch = start_epoch + TIMEZONE_OFFSET_MINUTES * 60
                     start_time = time.localtime(local_epoch)
                     local_epoch -= (start_time[4] % 15) * 60 + start_time[5]
@@ -839,7 +949,7 @@ def main():
                     if success:
                         last_parent = PARENTS[selected_parent_key]["name"]
                         last_oz = amount_oz
-                        last_epoch = time.time()
+                        last_epoch = now_epoch()
 
                     wizard_state = "idle"
                     draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
