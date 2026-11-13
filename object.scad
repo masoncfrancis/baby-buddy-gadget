@@ -4,7 +4,7 @@
 
 /* [Render Selection] */
 // Export "base", "lid", "knob", and "clamps" (or "all" to preview/print together)
-render_mode = "base"; // ["all", "base", "lid", "knob", "clamps"]
+render_mode = "clamps"; // ["all", "base", "lid", "knob", "clamps"]
 
 /* [2.5" HDD Screw (M3) Settings] */
 // Standard 2.5" HDD/SSD screws: M3 thread (3.0mm), ~5.4-5.8mm flat wafer head
@@ -333,7 +333,7 @@ module top_lid() {
 }
 
 // =========================================================================
-// 3. STEPPED M3 CLAMP BARS (Built-in 0.5mm Pinch Ridge Presses PCB Tight!)
+// 3. STEPPED M3 CLAMP BARS (Includes Full-Width Recessed OLED Bridge Clamp!)
 // =========================================================================
 module clamp_bars_set() {
     // 1. Encoder Bridge Clamp Bar
@@ -380,20 +380,32 @@ module clamp_bars_set() {
         }
     }
 
-    // 4. Two Single-Screw Stepped Edge-Clamp Washers
-    for (i = [0, 1]) {
-        translate([30, -6 + i*12, 0]) {
-            difference() {
-                union() {
-                    hull() {
-                        cylinder(d=6.8, h=2.0);
-                        translate([3.5, 0, 0]) cylinder(d=5.5, h=2.0);
-                    }
-                    translate([2.0, -2.5, 2.0])
-                        cube([3.5, 5.0, 0.5]);
+    // 4. NEW: SSD1306 OLED Full-Width Bridge Clamp Bar (Spans both side M3 towers!)
+    // Features two 0.5mm edge pinch pads that press the outer 2.2mm left/right margins
+    // of the OLED PCB, while arching over the SMD components in the center of the board!
+    oled_span = oled_pcb_w + 2 * m3_edge_off; // 31.6mm center-to-center hole span
+    translate([31, 0, 0]) {
+        difference() {
+            union() {
+                // Main structural bridge bar (8mm wide for anti-rocking stability)
+                hull() {
+                    translate([0, -oled_span/2, 0]) cylinder(d=8.0, h=2.4);
+                    translate([0,  oled_span/2, 0]) cylinder(d=8.0, h=2.4);
                 }
-                translate([0, 0, -0.1]) cylinder(d=m3_clear_dia, h=3.0);
+                // Left & Right 0.5mm stepped pinch pads (contacts only the outer 2.2mm PCB edges)
+                for (side = [-1, 1]) {
+                    pad_y = (side == -1) ? (-oled_pcb_w/2 + 0.2) : (oled_pcb_w/2 - 2.4);
+                    translate([-4.0, pad_y, 2.4])
+                        cube([8.0, 2.2, 0.5]);
+                }
             }
+            // M3 screw clearance holes
+            translate([0, -oled_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
+            translate([0,  oled_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
+
+            // Center SMD component relief channel (clears resistors/caps on back of OLED PCB)
+            translate([-4.5, -(oled_pcb_w - 5.2)/2, 1.8])
+                cube([9.0, oled_pcb_w - 5.2, 2.0]);
         }
     }
 }
