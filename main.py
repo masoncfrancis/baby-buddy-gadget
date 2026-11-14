@@ -76,6 +76,7 @@ DEFAULT_OZ = 4.00
 
 DEBOUNCE_MS = 180
 LONG_PRESS_MS = 700            # Hold knob 0.7s: Refreshes on main screen, or Cancels in menu!
+HARD_RESET_HOLD_TICKS = 28     # 28 * 250ms = 7.0s hold anywhere forces machine.reset()
 SLEEP_TIMEOUT_MS = 20000       # Turn off OLED & sleep after 20s of inactivity
 AUTO_SYNC_INTERVAL_SEC = 14400 # Background re-sync on wake only if >4 hours since last sync
 ERROR_SLEEP_TIMEOUT_MS = 60000 # Turn off OLED if stuck on error screen for 60s
@@ -101,10 +102,6 @@ oled.contrast(15)
 clk_pin = Pin(ENC_CLK_PIN, Pin.IN, Pin.PULL_UP)
 dt_pin = Pin(ENC_DT_PIN, Pin.IN, Pin.PULL_UP)
 sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
-
-# Initialize ADC(29) ONCE at boot without touching Pin(29, Pin.IN) later,
-# so we never corrupt the CYW43439 SPI bus!
-vsys_adc = ADC(29)
 
 wlan = network.WLAN(network.STA_IF)
 cached_batt_label = "--%"
@@ -137,30 +134,6 @@ def now_epoch():
     return _base_epoch
 
 
-def get_start_epoch_bounds(ref_epoch=None):
-    """
-    Calculates the 15-minute start time default & maximum allowed ceiling:
-    - Rounds down to the nearest 15-minute mark by default.
-    - If current time is 7 minutes or less (<= 420s) below the next 15-minute
-      increment, allows (and defaults to) rounding up by 1 increment (900s).
-    Returns: (default_start_epoch, max_allowed_start_epoch)
-    """
-    if ref_epoch is None:
-        ref_epoch = now_epoch()
-    local_epoch = ref_epoch + TIMEZONE_OFFSET_MINUTES * 60
-    t = time.localtime(local_epoch)
-    secs_into_quarter = (t[4] % 15) * 60 + t[5]
-    floor_local = local_epoch - secs_into_quarter
-    floor_epoch = floor_local - TIMEZONE_OFFSET_MINUTES * 60
-
-    secs_to_next_quarter = 900 - secs_into_quarter
-    if secs_to_next_quarter <= 7 * 60:  # 7 minutes (420s) or less to next 15m mark
-        max_epoch = floor_epoch + 900
-        return max_epoch, max_epoch
-    else:
-        return floor_epoch, floor_epoch
-
-
 # --- ROTARY ENCODER INTERRUPT HANDLER ---
 encoder_delta = 0
 last_clk_state = clk_pin.value()
@@ -185,6 +158,28 @@ def rotary_isr(pin):
 clk_pin.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=rotary_isr)
 
 
+# --- BACKGROUND 7-SECOND HARD RESET MONITOR ---
+# Runs on a hardware timer every 250ms independently of the main loop,
+# so holding the knob for 7 seconds reboots the Pico even if main() is frozen!
+_reset_hold_ticks = 0
+
+
+def _check_emergency_reset(timer):
+    global _reset_hold_ticks
+    if sw_pin.value() == 0:  # Button is pressed (Active-Low)
+        _reset_hold_ticks += 1
+        if _reset_hold_ticks >= HARD_RESET_HOLD_TICKS:  # 28 * 250ms = 7.0 seconds
+            machine.reset()
+    else:
+        _reset_hold_ticks = 0
+
+
+_reset_timer = machine.Timer(-1)
+_reset_timer.init(
+    period=250, mode=machine.Timer.PERIODIC, callback=_check_emergency_reset
+)
+
+
 def update_battery_status():
     """
     Official Pico W VSYS ADC sequence:
@@ -194,10 +189,9 @@ def update_battery_status():
     """
     global cached_batt_label
     try:
-        # 1. Open VSYS MOSFET gate on Pico W by driving GP25 (SPI CS) HIGH
         Pin(25, Pin.OUT, value=1)
         Pin(29, Pin.IN, pull=None)
-        time.sleep_ms(2)  # Let the VSYS/3 RC filter settle
+        time.sleep_ms(2)
 
         adc = ADC(29)
         raw = sum(adc.read_u16() for _ in range(5)) / 5
@@ -211,7 +205,6 @@ def update_battery_status():
     except Exception as e:
         print("Battery ADC read error:", e)
     finally:
-        # 3. Restore GP29 & GP25 to CYW43 PIO/SPI mode (alt=7) so Wi-Fi never hangs!
         try:
             Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
             Pin(25, Pin.OUT, value=0)
@@ -801,8 +794,10 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
         progress=0.75,
     )
 
-    # Preserve rounded-up start_epoch if within the 7-minute round-up window
-    end_epoch = max(now_epoch(), start_epoch)
+    end_epoch = now_epoch()
+    # Never submit a start time in the future if submission is delayed.
+    if start_epoch > end_epoch:
+        start_epoch = end_epoch
 
     url = f"{BABY_BUDDY_BASE_URL}/api/feedings/"
     headers = {
@@ -860,7 +855,7 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
             disable_wifi()
         gc.collect()
 
-    return success, end_epoch
+    return success
 
 
 # =========================================================================
@@ -871,7 +866,6 @@ def main():
     amount_oz = DEFAULT_OZ
     type_idx = 0
     start_epoch = 0
-    max_start_epoch = 0
     selected_parent_key = "parent_1"
     wizard_state = "idle"
     last_parent = ""
@@ -882,6 +876,9 @@ def main():
     sw_pressed = False
     sw_press_start_ms = 0
     sw_long_handled = False
+
+    # Sample battery voltage right at boot before Wi-Fi starts
+    update_battery_status()
 
     # 1. Verify config & sync NTP while Wi-Fi is active on boot
     verify_startup_config()
@@ -969,13 +966,9 @@ def main():
                     amount_oz = MAX_OZ
                 draw_amount_menu(amount_oz)
             elif wizard_state == "start":
-                _, current_max = get_start_epoch_bounds()
-                if current_max > max_start_epoch:
-                    max_start_epoch = current_max
                 candidate_epoch = start_epoch + steps * 15 * 60
-                if candidate_epoch > max_start_epoch:
-                    candidate_epoch = max_start_epoch
-                start_epoch = candidate_epoch
+                if candidate_epoch <= now_epoch():
+                    start_epoch = candidate_epoch
                 draw_start_menu(start_epoch)
             elif wizard_state == "parent":
                 parent_keys = list(PARENTS.keys())
@@ -1026,7 +1019,11 @@ def main():
                     wizard_state = "amount"
                     draw_amount_menu(amount_oz)
                 elif wizard_state == "amount":
-                    start_epoch, max_start_epoch = get_start_epoch_bounds()
+                    start_epoch = now_epoch()
+                    local_epoch = start_epoch + TIMEZONE_OFFSET_MINUTES * 60
+                    start_time = time.localtime(local_epoch)
+                    local_epoch -= (start_time[4] % 15) * 60 + start_time[5]
+                    start_epoch = local_epoch - TIMEZONE_OFFSET_MINUTES * 60
                     wizard_state = "start"
                     draw_start_menu(start_epoch)
                 elif wizard_state == "start":
@@ -1037,14 +1034,14 @@ def main():
                     draw_summary(type_idx, amount_oz, start_epoch, selected_parent_key)
                 elif wizard_state == "confirm":
                     selected_type = FEED_TYPES[type_idx]
-                    success, logged_end_epoch = submit_bottle_feeding(
+                    success = submit_bottle_feeding(
                         selected_parent_key, amount_oz, selected_type, start_epoch
                     )
 
                     if success:
                         last_parent = PARENTS[selected_parent_key]["name"]
                         last_oz = amount_oz
-                        last_epoch = logged_end_epoch
+                        last_epoch = now_epoch()
 
                     wizard_state = "idle"
                     draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
@@ -1056,3 +1053,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
