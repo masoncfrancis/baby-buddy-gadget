@@ -5,6 +5,7 @@ import time
 import ntptime
 import machine
 import framebuf
+import gc
 from machine import Pin, I2C, ADC
 from ssd1306 import SSD1306_I2C
 
@@ -101,12 +102,14 @@ clk_pin = Pin(ENC_CLK_PIN, Pin.IN, Pin.PULL_UP)
 dt_pin = Pin(ENC_DT_PIN, Pin.IN, Pin.PULL_UP)
 sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
 
+# Initialize ADC(29) ONCE at boot without touching Pin(29, Pin.IN) later,
+# so we never corrupt the CYW43439 SPI bus!
+vsys_adc = ADC(29)
+
 wlan = network.WLAN(network.STA_IF)
 cached_batt_label = "--%"
 
 # --- HARDWARE CRYSTAL MONOTONIC CLOCK ---
-# Locks UTC time to the RP2040's 1MHz crystal timer (ticks_ms) so CPU underclocking
-# (24MHz <-> 125MHz) NEVER causes the clock to slow down or drift during sleep!
 _base_epoch = 0
 _base_ticks_ms = time.ticks_ms()
 _remainder_ms = 0
@@ -132,6 +135,30 @@ def now_epoch():
         _remainder_ms = total_ms % 1000
         _base_ticks_ms = now_t
     return _base_epoch
+
+
+def get_start_epoch_bounds(ref_epoch=None):
+    """
+    Calculates the 15-minute start time default & maximum allowed ceiling:
+    - Rounds down to the nearest 15-minute mark by default.
+    - If current time is 7 minutes or less (<= 420s) below the next 15-minute
+      increment, allows (and defaults to) rounding up by 1 increment (900s).
+    Returns: (default_start_epoch, max_allowed_start_epoch)
+    """
+    if ref_epoch is None:
+        ref_epoch = now_epoch()
+    local_epoch = ref_epoch + TIMEZONE_OFFSET_MINUTES * 60
+    t = time.localtime(local_epoch)
+    secs_into_quarter = (t[4] % 15) * 60 + t[5]
+    floor_local = local_epoch - secs_into_quarter
+    floor_epoch = floor_local - TIMEZONE_OFFSET_MINUTES * 60
+
+    secs_to_next_quarter = 900 - secs_into_quarter
+    if secs_to_next_quarter <= 7 * 60:  # 7 minutes (420s) or less to next 15m mark
+        max_epoch = floor_epoch + 900
+        return max_epoch, max_epoch
+    else:
+        return floor_epoch, floor_epoch
 
 
 # --- ROTARY ENCODER INTERRUPT HANDLER ---
@@ -160,23 +187,36 @@ clk_pin.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=rotary_isr)
 
 def update_battery_status():
     """
-    Reads VSYS voltage via internal ADC(29).
-    Best called when Wi-Fi is idle/disabled so GP25/GP29 SPI CS doesn't interfere.
+    Official Pico W VSYS ADC sequence:
+    1. Pulls GP25 HIGH to enable the VSYS/3 FET divider & pause CYW43 SPI.
+    2. Sets GP29 to high-impedance input & samples ADC(29).
+    3. Restores GP29 and GP25 so CYW43 Wi-Fi never freezes on the next wake!
     """
     global cached_batt_label
     try:
-        Pin(29, Pin.IN)
+        # 1. Open VSYS MOSFET gate on Pico W by driving GP25 (SPI CS) HIGH
+        Pin(25, Pin.OUT, value=1)
+        Pin(29, Pin.IN, pull=None)
+        time.sleep_ms(2)  # Let the VSYS/3 RC filter settle
+
         adc = ADC(29)
         raw = sum(adc.read_u16() for _ in range(5)) / 5
         vsys = (raw * 3.3 / 65535) * 3.0
 
         if vsys > 4.45:
             cached_batt_label = "USB"
-        else:
+        elif vsys > 2.0:
             pct = int(max(0, min(100, (vsys - 3.30) / (4.15 - 3.30) * 100)))
             cached_batt_label = f"{pct}%"
     except Exception as e:
         print("Battery ADC read error:", e)
+    finally:
+        # 3. Restore GP29 & GP25 to CYW43 PIO/SPI mode (alt=7) so Wi-Fi never hangs!
+        try:
+            Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
+            Pin(25, Pin.OUT, value=0)
+        except Exception:
+            pass
     return cached_batt_label
 
 
@@ -269,7 +309,7 @@ def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
     if last_epoch is None:
         draw_centered_scaled_text("NONE", 22, scale=2, color=1)
         oled.hline(0, 52, 128, 1)
-        draw_centered_text("HOLD TO REFRESH", 55, 1)
+        draw_centered_text("PUSH TO LOG", 55, 1)
         oled.show()
         return
 
@@ -293,9 +333,9 @@ def draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch):
         sub_line = f"{diff_h}h ago ({clock_str})"
     draw_centered_text(sub_line[:16], 38, 1)
 
-    # 4. Bottom Footer Prompt (Click = Log, Hold = Refresh Latest Feed)
+    # 4. Bottom Footer Prompt
     oled.hline(0, 52, 128, 1)
-    draw_centered_text("CLK:LOG HOLD:REF", 55, 1)
+    draw_centered_text("PUSH TO LOG NEW", 55, 1)
 
     oled.show()
 
@@ -354,7 +394,6 @@ def draw_start_menu(start_epoch):
     draw_centered_text("START TIME", 3, 0)
     draw_centered_text(format_date(start_epoch), 16)
 
-    # Render '12:45' in 2x scale and 'PM' right beside it so it fits cleanly!
     time_str, ampm = format_clock_parts(start_epoch)
     num_w = len(time_str) * 16
     ampm_w = 2 * 8
@@ -406,10 +445,6 @@ def draw_modal(title, big_line, sub_line="", progress=None):
 
 
 def halt_on_error(title, big_line, sub_line):
-    """
-    Locks the device on an error screen, but powers down Wi-Fi and turns off
-    the OLED after 60s so an error never drains the LiPo battery overnight.
-    """
     global encoder_delta
     print(f"FATAL CONFIG ERROR: {title} | {big_line} | {sub_line}")
     if ENABLE_CPU_UNDERCLOCK:
@@ -421,7 +456,6 @@ def halt_on_error(title, big_line, sub_line):
     while True:
         if screen_on and time.ticks_diff(time.ticks_ms(), start_ms) > ERROR_SLEEP_TIMEOUT_MS:
             oled.poweroff()
-            led.off()
             if ENABLE_CPU_UNDERCLOCK:
                 machine.freq(FREQ_IDLE)
             screen_on = False
@@ -438,7 +472,6 @@ def halt_on_error(title, big_line, sub_line):
             else:
                 time.sleep_ms(100)
         else:
-            led.toggle()
             time.sleep_ms(300)
 
 
@@ -446,77 +479,92 @@ def halt_on_error(title, big_line, sub_line):
 # 6. POWER MANAGEMENT, WIFI & STARTUP CONFIG CHECK
 # =========================================================================
 def disable_wifi():
+    """
+    Safely powers down the Wi-Fi radio WITHOUT calling wlan.deinit(),
+    which prevents CYW43439 SPI bus deadlocks on subsequent wake/refresh cycles!
+    """
     try:
         led.off()
+    except Exception:
+        pass
+    try:
         if wlan.isconnected():
             wlan.disconnect()
         wlan.active(False)
-        wlan.deinit()
-    except Exception:
-        pass
+    except Exception as e:
+        print("Wi-Fi disable error:", e)
+    time.sleep_ms(50)  # Let CYW43 SPI bus settle before sampling ADC(29)
     update_battery_status()
+    gc.collect()
 
 
 def enter_sleep_mode():
-    now_epoch()  # Roll over elapsed seconds before sleeping
+    now_epoch()
     oled.poweroff()
     if ENABLE_CPU_UNDERCLOCK:
         disable_wifi()
         machine.freq(FREQ_IDLE)
-    else:
-        led.off()
 
 
 def wake_from_sleep_mode():
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
-    now_epoch()  # Update monotonic clock immediately on wake
+    now_epoch()
     update_battery_status()
     oled.poweron()
 
 
 def sync_clock():
-    """Synchronizes Pico clock with NTP and locks it to the 1MHz crystal timer."""
+    """Synchronizes Pico clock with NTP using a strict 2-second timeout so it never hangs."""
     if not wlan.isconnected():
         return False
     ntptime.host = "pool.ntp.org"
-    for _ in range(3):
+    ntptime.timeout = 2  # CRITICAL: Prevents infinite hang if UDP packet drops!
+    for _ in range(2):
         try:
+            gc.collect()
             ntptime.settime()
             set_accurate_epoch(time.time())
             return True
         except Exception as e:
             print("NTP sync attempt failed:", e)
-            time.sleep_ms(250)
+            time.sleep_ms(200)
     return False
 
 
 def connect_wifi(sync_ntp=True):
-    """Connects to Wi-Fi cleanly even after wlan.deinit()."""
-    global wlan
+    """Connects to Wi-Fi reliably without re-instantiating or locking the CYW43 driver."""
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
 
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+    gc.collect()
     try:
+        if not wlan.active():
+            wlan.active(True)
+            time.sleep_ms(100)  # Give CYW43 radio time to wake up
         pm_perf = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11140)
         wlan.config(pm=pm_perf)
-    except Exception:
-        pass
+    except Exception as e:
+        print("WLAN wake error:", e)
 
     if wlan.isconnected():
-        led.on()
+        try:
+            led.on()
+        except Exception:
+            pass
         if sync_ntp:
             sync_clock()
         return True
 
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    try:
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    except Exception as e:
+        print("WLAN connect error:", e)
+        return False
 
     timeout = 24
     step = 0
     while not wlan.isconnected() and timeout > 0:
-        led.toggle()
         step += 1
         draw_modal(
             title="CONNECTING",
@@ -524,11 +572,14 @@ def connect_wifi(sync_ntp=True):
             sub_line=WIFI_SSID[:16],
             progress=(step / 12.0) % 1.0,
         )
-        time.sleep(0.4)
+        time.sleep_ms(400)
         timeout -= 1
 
     if wlan.isconnected():
-        led.on()
+        try:
+            led.on()
+        except Exception:
+            pass
         if sync_ntp:
             sync_clock()
         return True
@@ -539,10 +590,6 @@ def connect_wifi(sync_ntp=True):
 
 
 def parse_iso_to_utc_epoch(iso_str):
-    """
-    Parses Baby Buddy ISO-8601 timestamp (e.g. '2026-11-13T18:10:00Z' or
-    '2026-11-13T13:10:00-05:00') into accurate UTC epoch seconds.
-    """
     date_part, rest = iso_str.split("T")
     time_part = rest[:8]
 
@@ -569,7 +616,7 @@ def parse_iso_to_utc_epoch(iso_str):
 
 
 def fetch_latest_feeding():
-    """Returns latest feeding (amount_oz, utc_epoch, parent_name), or None if unavailable."""
+    """Returns latest feeding (amount_oz, utc_epoch, parent_name) with a 5s socket timeout."""
     parent = PARENTS["parent_1"]
     url = (
         f"{BABY_BUDDY_BASE_URL}/api/feedings/"
@@ -578,10 +625,16 @@ def fetch_latest_feeding():
     headers = {
         "Authorization": f"Token {parent['api_token']}",
         "Accept": "application/json",
+        "Connection": "close",
     }
     response = None
+    gc.collect()
     try:
-        response = urequests.get(url, headers=headers)
+        try:
+            response = urequests.get(url, headers=headers, timeout=5)
+        except TypeError:
+            response = urequests.get(url, headers=headers)
+
         if response.status_code != 200:
             print("Latest feeding lookup failed:", response.status_code)
             return None
@@ -608,19 +661,30 @@ def fetch_latest_feeding():
         return None
     finally:
         if response:
-            response.close()
+            try:
+                response.close()
+            except Exception:
+                pass
+        gc.collect()
 
 
 def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
     """
     Connects to Wi-Fi, syncs NTP, fetches the latest feeding from Baby Buddy,
-    shows a confirmation toast, and powers Wi-Fi back down.
+    shows a confirmation toast, and safely powers Wi-Fi back down.
     """
     draw_modal("REFRESHING", "LATEST...", "Connecting Wi-Fi", progress=0.25)
 
     if connect_wifi(sync_ntp=True):
         draw_modal("REFRESHING", "FETCHING", "Baby Buddy API", progress=0.75)
         latest = fetch_latest_feeding()
+
+        # Always power down Wi-Fi BEFORE showing the final toast & returning to main loop
+        if ENABLE_CPU_UNDERCLOCK:
+            disable_wifi()
+        else:
+            update_battery_status()
+
         if latest:
             last_oz, last_epoch, fetched_parent = latest
             if fetched_parent:
@@ -632,16 +696,11 @@ def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
                     f"{format_oz(last_oz)}oz ({format_clock(last_epoch)})",
                     progress=1.0,
                 )
-                time.sleep_ms(900)
+                time.sleep_ms(800)
         else:
             if show_toast:
-                draw_modal("REFRESHED", "NO LOGS", "No feeds found", progress=1.0)
-                time.sleep_ms(900)
-
-        if ENABLE_CPU_UNDERCLOCK:
-            disable_wifi()
-        else:
-            update_battery_status()
+                draw_modal("REFRESHED", "NO UPDATE", "Keep cached feed", progress=1.0)
+                time.sleep_ms(800)
     else:
         draw_modal("WIFI FAILED", "NO NET", "Keep cached feed", progress=None)
         time.sleep_ms(1200)
@@ -651,10 +710,6 @@ def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
 
 
 def verify_startup_config():
-    """
-    Tests Wi-Fi, Server URL, Child ID, and both Parent API tokens on boot.
-    If any check fails (400, 401, 403, 404, or unreachable), halts on error screen.
-    """
     if not connect_wifi(sync_ntp=True):
         halt_on_error("WIFI ERROR", "NO WIFI", "Check Config")
 
@@ -668,10 +723,15 @@ def verify_startup_config():
         headers = {
             "Authorization": f"Token {parent['api_token']}",
             "Accept": "application/json",
+            "Connection": "close",
         }
         response = None
+        gc.collect()
         try:
-            response = urequests.get(url, headers=headers)
+            try:
+                response = urequests.get(url, headers=headers, timeout=5)
+            except TypeError:
+                response = urequests.get(url, headers=headers)
             status = response.status_code
             if status != 200:
                 print(
@@ -694,10 +754,14 @@ def verify_startup_config():
             halt_on_error("CONFIG ERROR", "UNREACH", "Check Base URL")
         finally:
             if response:
-                response.close()
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            gc.collect()
 
     draw_modal("STARTUP CHECK", "OK!", "Config Verified", progress=1.0)
-    time.sleep(1.2)
+    time.sleep_ms(1000)
 
 
 def any_button_pressed():
@@ -705,7 +769,11 @@ def any_button_pressed():
 
 
 def wait_for_all_released():
+    """Waits for button release with a 2.5s safety timeout so a stuck pin never freezes the UI."""
+    start_wait = time.ticks_ms()
     while any_button_pressed():
+        if time.ticks_diff(time.ticks_ms(), start_wait) > 2500:
+            break
         time.sleep_ms(20)
     time.sleep_ms(DEBOUNCE_MS)
 
@@ -723,7 +791,7 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
 
     if not connect_wifi(sync_ntp=True):
         draw_modal("WIFI FAILED", "NO NET", "Check Router", progress=0.0)
-        time.sleep(3)
+        time.sleep_ms(2500)
         return False
 
     draw_modal(
@@ -733,15 +801,15 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
         progress=0.75,
     )
 
-    end_epoch = now_epoch()
-    if start_epoch > end_epoch:
-        start_epoch = end_epoch
+    # Preserve rounded-up start_epoch if within the 7-minute round-up window
+    end_epoch = max(now_epoch(), start_epoch)
 
     url = f"{BABY_BUDDY_BASE_URL}/api/feedings/"
     headers = {
         "Authorization": f"Token {parent['api_token']}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "Connection": "close",
     }
     payload = {
         "child": CHILD_ID,
@@ -756,8 +824,14 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
 
     response = None
     success = False
+    gc.collect()
     try:
-        response = urequests.post(url, headers=headers, data=ujson.dumps(payload))
+        body = ujson.dumps(payload)
+        try:
+            response = urequests.post(url, headers=headers, data=body, timeout=6)
+        except TypeError:
+            response = urequests.post(url, headers=headers, data=body)
+
         if response.status_code in (200, 201):
             draw_modal(
                 title="FEEDING SAVED",
@@ -766,7 +840,7 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
                 progress=1.0,
             )
             success = True
-            time.sleep(2.0)
+            time.sleep_ms(1800)
         else:
             print("API Error:", response.status_code, response.text)
             halt_on_error(
@@ -775,14 +849,18 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
     except Exception as e:
         print("Request Exception:", e)
         draw_modal("SERVER ERROR", "OFFLINE", "Cannot reach API")
-        time.sleep(3)
+        time.sleep_ms(2500)
     finally:
         if response:
-            response.close()
+            try:
+                response.close()
+            except Exception:
+                pass
         if ENABLE_CPU_UNDERCLOCK:
             disable_wifi()
+        gc.collect()
 
-    return success
+    return success, end_epoch
 
 
 # =========================================================================
@@ -793,6 +871,7 @@ def main():
     amount_oz = DEFAULT_OZ
     type_idx = 0
     start_epoch = 0
+    max_start_epoch = 0
     selected_parent_key = "parent_1"
     wizard_state = "idle"
     last_parent = ""
@@ -854,6 +933,7 @@ def main():
                 wizard_state = "idle"
                 draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
                 wait_for_all_released()
+                encoder_delta = 0
                 sw_pressed = False
                 sw_long_handled = False
                 last_activity_ms = time.ticks_ms()
@@ -889,9 +969,13 @@ def main():
                     amount_oz = MAX_OZ
                 draw_amount_menu(amount_oz)
             elif wizard_state == "start":
+                _, current_max = get_start_epoch_bounds()
+                if current_max > max_start_epoch:
+                    max_start_epoch = current_max
                 candidate_epoch = start_epoch + steps * 15 * 60
-                if candidate_epoch <= now_epoch():
-                    start_epoch = candidate_epoch
+                if candidate_epoch > max_start_epoch:
+                    candidate_epoch = max_start_epoch
+                start_epoch = candidate_epoch
                 draw_start_menu(start_epoch)
             elif wizard_state == "parent":
                 parent_keys = list(PARENTS.keys())
@@ -921,10 +1005,10 @@ def main():
                     last_parent, last_oz, last_epoch = refresh_from_server(
                         last_parent, last_oz, last_epoch, show_toast=True
                     )
-                encoder_delta = 0
                 wizard_state = "idle"
                 draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
                 wait_for_all_released()
+                encoder_delta = 0  # Clear any accidental knob movement during button release
                 sw_pressed = False
                 sw_long_handled = False
                 last_activity_ms = time.ticks_ms()
@@ -942,11 +1026,7 @@ def main():
                     wizard_state = "amount"
                     draw_amount_menu(amount_oz)
                 elif wizard_state == "amount":
-                    start_epoch = now_epoch()
-                    local_epoch = start_epoch + TIMEZONE_OFFSET_MINUTES * 60
-                    start_time = time.localtime(local_epoch)
-                    local_epoch -= (start_time[4] % 15) * 60 + start_time[5]
-                    start_epoch = local_epoch - TIMEZONE_OFFSET_MINUTES * 60
+                    start_epoch, max_start_epoch = get_start_epoch_bounds()
                     wizard_state = "start"
                     draw_start_menu(start_epoch)
                 elif wizard_state == "start":
@@ -957,14 +1037,14 @@ def main():
                     draw_summary(type_idx, amount_oz, start_epoch, selected_parent_key)
                 elif wizard_state == "confirm":
                     selected_type = FEED_TYPES[type_idx]
-                    success = submit_bottle_feeding(
+                    success, logged_end_epoch = submit_bottle_feeding(
                         selected_parent_key, amount_oz, selected_type, start_epoch
                     )
 
                     if success:
                         last_parent = PARENTS[selected_parent_key]["name"]
                         last_oz = amount_oz
-                        last_epoch = now_epoch()
+                        last_epoch = logged_end_epoch
 
                     wizard_state = "idle"
                     draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
@@ -976,4 +1056,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
