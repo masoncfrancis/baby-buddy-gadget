@@ -7,13 +7,13 @@ UTC. The device uses a fixed offset, so update it when daylight saving time
 changes.
 
 | Time zone | Standard | Daylight saving |
-| --- | ---: | ---: |
-| Eastern | `-300` | `-240` |
-| Central | `-360` | `-300` |
-| Mountain | `-420` | `-360` |
-| Pacific | `-480` | `-420` |
-| Alaska | `-540` | `-480` |
-| Hawaii | `-600` | `-600` |
+| --------- | -------: | --------------: |
+| Eastern   |   `-300` |          `-240` |
+| Central   |   `-360` |          `-300` |
+| Mountain  |   `-420` |          `-360` |
+| Pacific   |   `-480` |          `-420` |
+| Alaska    |   `-540` |          `-480` |
+| Hawaii    |   `-600` |          `-600` |
 
 Examples:
 
@@ -30,3 +30,7 @@ Upload updated configuration to Pico:
 ```bash
 ampy --port /dev/tty.usbmodem114401 put .env
 ```
+
+## Hard Reboot
+
+To perform a hard reboot of the device, press and hold the knob for 7 seconds. The device will restart.
