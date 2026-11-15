@@ -1,6 +1,7 @@
 import network
 import urequests
 import ujson
+import usocket
 import time
 import ntptime
 import machine
@@ -75,11 +76,14 @@ MAX_OZ = 12.00
 DEFAULT_OZ = 4.00
 
 DEBOUNCE_MS = 180
-LONG_PRESS_MS = 700            # Hold knob 0.7s: Refreshes on main screen, or Cancels in menu!
-HARD_RESET_HOLD_TICKS = 28     # 28 * 250ms = 7.0s hold anywhere forces machine.reset()
-SLEEP_TIMEOUT_MS = 20000       # Turn off OLED & sleep after 20s of inactivity
-AUTO_SYNC_INTERVAL_SEC = 14400 # Background re-sync on wake only if >4 hours since last sync
-ERROR_SLEEP_TIMEOUT_MS = 60000 # Turn off OLED if stuck on error screen for 60s
+LONG_PRESS_MS = 700              # Hold knob 0.7s: Refreshes on main screen, or Cancels in menu!
+HARD_RESET_HOLD_TICKS = 28       # 28 * 250ms = 7.0s hold anywhere forces machine.reset()
+SLEEP_TIMEOUT_MS = 20000         # Turn off OLED & sleep after 20s of inactivity
+ERROR_SLEEP_TIMEOUT_MS = 60000   # Turn off OLED if stuck on error screen for 60s
+SLEEP_BATT_CHECK_SEC = 1800      # Check battery voltage every 30 mins while asleep
+LOW_BATT_CUTOFF_VOLTS = 3.22     # Enter protective hibernate at or below 3.22V
+LOW_BATT_RECOVER_VOLTS = 3.50    # Exit hibernate once USB is plugged in or LiPo > 3.50V
+MIN_VALID_EPOCH = 1735689600     # Jan 1, 2025 00:00:00 UTC (guards against 2021 unsynced RTC)
 
 FREQ_ACTIVE = 125_000_000
 FREQ_IDLE = 24_000_000
@@ -90,11 +94,14 @@ FEED_TYPES = [
     {"label": "FORTIFIED", "api_value": "fortified breast milk"},
 ]
 
+MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
 # =========================================================================
 # 4. HARDWARE INITIALIZATION & CRYSTAL-LOCKED CLOCK
 # =========================================================================
-led = Pin("LED", Pin.OUT)
-
 i2c = I2C(0, sda=Pin(OLED_SDA_PIN), scl=Pin(OLED_SCL_PIN), freq=400000)
 oled = SSD1306_I2C(128, 64, i2c)
 oled.contrast(15)
@@ -104,25 +111,27 @@ dt_pin = Pin(ENC_DT_PIN, Pin.IN, Pin.PULL_UP)
 sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
 
 wlan = network.WLAN(network.STA_IF)
+wlan_is_active = False
 cached_batt_label = "--%"
+last_vsys_volts = 4.00
 
 # --- HARDWARE CRYSTAL MONOTONIC CLOCK ---
-_base_epoch = 0
+# Continuously rolls over _base_ticks_ms every second (both awake and asleep)
+# so time.ticks_diff() never approaches the 6.2-day 30-bit wraparound limit!
+_base_epoch = time.time()
 _base_ticks_ms = time.ticks_ms()
 _remainder_ms = 0
-_last_ntp_sync_epoch = 0
 
 
 def set_accurate_epoch(utc_epoch):
-    global _base_epoch, _base_ticks_ms, _remainder_ms, _last_ntp_sync_epoch
+    global _base_epoch, _base_ticks_ms, _remainder_ms
     _base_epoch = int(utc_epoch)
     _base_ticks_ms = time.ticks_ms()
     _remainder_ms = 0
-    _last_ntp_sync_epoch = _base_epoch
 
 
 def now_epoch():
-    """Returns exact UTC epoch seconds immune to CPU frequency scaling."""
+    """Returns exact UTC epoch seconds immune to CPU frequency scaling & tick overflow."""
     global _base_epoch, _base_ticks_ms, _remainder_ms
     now_t = time.ticks_ms()
     diff_ms = time.ticks_diff(now_t, _base_ticks_ms)
@@ -131,7 +140,15 @@ def now_epoch():
         _base_epoch += total_ms // 1000
         _remainder_ms = total_ms % 1000
         _base_ticks_ms = now_t
+    elif diff_ms < 0:
+        # Safety guard if ticks_ms ever wraps unexpectedly
+        _base_ticks_ms = now_t
     return _base_epoch
+
+
+def is_clock_valid():
+    """Returns True if the clock has been synced past Jan 1, 2025."""
+    return now_epoch() > MIN_VALID_EPOCH
 
 
 # --- ROTARY ENCODER INTERRUPT HANDLER ---
@@ -159,8 +176,6 @@ clk_pin.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=rotary_isr)
 
 
 # --- BACKGROUND 7-SECOND HARD RESET MONITOR ---
-# Runs on a hardware timer every 250ms independently of the main loop,
-# so holding the knob for 7 seconds reboots the Pico even if main() is frozen!
 _reset_hold_ticks = 0
 
 
@@ -182,32 +197,32 @@ _reset_timer.init(
 
 def update_battery_status():
     """
-    Official Pico W VSYS ADC sequence:
-    1. Pulls GP25 HIGH to enable the VSYS/3 FET divider & pause CYW43 SPI.
-    2. Sets GP29 to high-impedance input & samples ADC(29).
-    3. Restores GP29 and GP25 so CYW43 Wi-Fi never freezes on the next wake!
+    Safely reads VSYS on Pico W without causing [CYW43] STALL(0;165-165):
+    1. Only runs when Wi-Fi is inactive.
+    2. Temporarily switches GP29 to ADC input, reads VSYS, and IMMEDIATELY
+       restores GP29 to PIO1 (Pin.ALT, alt=7) so CYW43 SPI never stalls!
     """
-    global cached_batt_label
+    global cached_batt_label, last_vsys_volts
+    if wlan_is_active:
+        return cached_batt_label
     try:
-        Pin(25, Pin.OUT, value=1)
-        Pin(29, Pin.IN, pull=None)
-        time.sleep_ms(2)
-
+        Pin(29, Pin.IN)
         adc = ADC(29)
         raw = sum(adc.read_u16() for _ in range(5)) / 5
         vsys = (raw * 3.3 / 65535) * 3.0
 
-        if vsys > 4.45:
-            cached_batt_label = "USB"
-        elif vsys > 2.0:
-            pct = int(max(0, min(100, (vsys - 3.30) / (4.15 - 3.30) * 100)))
-            cached_batt_label = f"{pct}%"
+        if vsys > 1.8:
+            last_vsys_volts = vsys
+            if vsys > 4.45:
+                cached_batt_label = "USB"
+            else:
+                pct = int(max(0, min(100, (vsys - 3.30) / (4.15 - 3.30) * 100)))
+                cached_batt_label = f"{pct}%"
     except Exception as e:
         print("Battery ADC read error:", e)
     finally:
         try:
             Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
-            Pin(25, Pin.OUT, value=0)
         except Exception:
             pass
     return cached_batt_label
@@ -447,6 +462,7 @@ def halt_on_error(title, big_line, sub_line):
     start_ms = time.ticks_ms()
     screen_on = True
     while True:
+        now_epoch()
         if screen_on and time.ticks_diff(time.ticks_ms(), start_ms) > ERROR_SLEEP_TIMEOUT_MS:
             oled.poweroff()
             if ENABLE_CPU_UNDERCLOCK:
@@ -469,26 +485,86 @@ def halt_on_error(title, big_line, sub_line):
 
 
 # =========================================================================
-# 6. POWER MANAGEMENT, WIFI & STARTUP CONFIG CHECK
+# 6. POWER MANAGEMENT, LOW-BATTERY CUTOFF & WIFI
 # =========================================================================
 def disable_wifi():
     """
-    Safely powers down the Wi-Fi radio WITHOUT calling wlan.deinit(),
-    which prevents CYW43439 SPI bus deadlocks on subsequent wake/refresh cycles!
+    Powers down Wi-Fi via wlan.deinit(), waits for the CYW43 SPI bus to settle,
+    samples ADC(29), and restores GP29 to PIO1 (alt=7).
     """
-    try:
-        led.off()
-    except Exception:
-        pass
+    global wlan_is_active
     try:
         if wlan.isconnected():
             wlan.disconnect()
         wlan.active(False)
-    except Exception as e:
-        print("Wi-Fi disable error:", e)
-    time.sleep_ms(50)  # Let CYW43 SPI bus settle before sampling ADC(29)
+        wlan.deinit()
+    except Exception:
+        pass
+    wlan_is_active = False
+    time.sleep_ms(30)
     update_battery_status()
     gc.collect()
+
+
+def enter_low_battery_cutoff(show_warning=True):
+    """
+    Protects the LiPo battery & RP2040 flash from brownout if VSYS <= 3.22V:
+    - Turns off Wi-Fi and OLED, drops CPU to 24MHz, and blocks Wi-Fi current spikes.
+    - If user presses button/knob while low, flashes 'LOW BATTERY / CHARGE!' for 2s.
+    - Automatically wakes back up as soon as USB power is connected (VSYS > 3.50V)!
+    """
+    global encoder_delta
+    disable_wifi()
+
+    if show_warning:
+        if ENABLE_CPU_UNDERCLOCK:
+            machine.freq(FREQ_ACTIVE)
+        draw_modal("LOW BATTERY", "CHARGE!", "Plug in USB", progress=0.0)
+        time.sleep_ms(2200)
+
+    oled.poweroff()
+    if ENABLE_CPU_UNDERCLOCK:
+        machine.freq(FREQ_IDLE)
+
+    encoder_delta = 0
+    last_check_ms = time.ticks_ms()
+
+    while True:
+        now_epoch()  # Keep monotonic clock ticking accurately even during hibernate!
+        now = time.ticks_ms()
+
+        # Check every 2 seconds if USB cable was plugged in
+        if time.ticks_diff(now, last_check_ms) >= 2000:
+            last_check_ms = now
+            update_battery_status()
+            if last_vsys_volts >= LOW_BATT_RECOVER_VOLTS:
+                # Battery is charging or above recovery threshold! Wake back up:
+                if ENABLE_CPU_UNDERCLOCK:
+                    machine.freq(FREQ_ACTIVE)
+                oled.poweron()
+                encoder_delta = 0
+                return
+
+        # If user touches knob/button while battery is still dead, flash brief warning
+        if encoder_delta != 0 or any_button_pressed():
+            encoder_delta = 0
+            update_battery_status()
+            if last_vsys_volts >= LOW_BATT_RECOVER_VOLTS:
+                if ENABLE_CPU_UNDERCLOCK:
+                    machine.freq(FREQ_ACTIVE)
+                oled.poweron()
+                return
+            if ENABLE_CPU_UNDERCLOCK:
+                machine.freq(FREQ_ACTIVE)
+            draw_modal("LOW BATTERY", "CHARGE!", "Plug in USB", progress=0.0)
+            wait_for_all_released()
+            time.sleep_ms(1500)
+            oled.poweroff()
+            if ENABLE_CPU_UNDERCLOCK:
+                machine.freq(FREQ_IDLE)
+            encoder_delta = 0
+
+        time.sleep_ms(100)
 
 
 def enter_sleep_mode():
@@ -497,6 +573,8 @@ def enter_sleep_mode():
     if ENABLE_CPU_UNDERCLOCK:
         disable_wifi()
         machine.freq(FREQ_IDLE)
+    if last_vsys_volts <= LOW_BATT_CUTOFF_VOLTS:
+        enter_low_battery_cutoff(show_warning=False)
 
 
 def wake_from_sleep_mode():
@@ -504,60 +582,130 @@ def wake_from_sleep_mode():
         machine.freq(FREQ_ACTIVE)
     now_epoch()
     update_battery_status()
+    if last_vsys_volts <= LOW_BATT_CUTOFF_VOLTS:
+        enter_low_battery_cutoff(show_warning=True)
     oled.poweron()
 
 
+def sync_clock_from_baby_buddy():
+    """
+    Fallback clock sync if internet/NTP is down:
+    Reads the HTTP 'Date: Sun, 15 Nov 2026 05:45:12 GMT' header directly
+    from the local Baby Buddy server over LAN!
+    """
+    s = None
+    gc.collect()
+    try:
+        clean_url = BABY_BUDDY_BASE_URL.split("://")[-1].split("/")[0]
+        if ":" in clean_url:
+            host, port_str = clean_url.split(":", 1)
+            port = int(port_str)
+        else:
+            host = clean_url
+            port = 80
+
+        addr = usocket.getaddrinfo(host, port)[0][-1]
+        s = usocket.socket()
+        s.settimeout(2)
+        s.connect(addr)
+        req = f"HEAD /api/ HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        s.send(req.encode())
+
+        while True:
+            line = s.readline()
+            if not line or line == b"\r\n":
+                break
+            if line.lower().startswith(b"date:"):
+                # Example: b'Date: Sun, 15 Nov 2026 05:45:12 GMT\r\n'
+                parts = line.decode().strip().split()
+                if len(parts) >= 6:
+                    day = int(parts[2])
+                    month = MONTH_MAP.get(parts[3], 1)
+                    year = int(parts[4])
+                    hms = [int(x) for x in parts[5].split(":")]
+                    utc_epoch = time.mktime(
+                        (year, month, day, hms[0], hms[1], hms[2], 0, 0)
+                    )
+                    if utc_epoch > MIN_VALID_EPOCH:
+                        set_accurate_epoch(utc_epoch)
+                        print("Synced clock from local Baby Buddy HTTP Date header!")
+                        return True
+    except Exception as e:
+        print("Local HTTP Date sync failed:", e)
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
+        gc.collect()
+    return False
+
+
 def sync_clock():
-    """Synchronizes Pico clock with NTP using a strict 2-second timeout so it never hangs."""
+    """
+    1. Tries public NTP (pool.ntp.org) with a strict 2-second timeout.
+    2. If ISP/DNS is down, falls back to reading the HTTP Date header
+       directly from the local Baby Buddy server on your LAN!
+    """
     if not wlan.isconnected():
         return False
+
     ntptime.host = "pool.ntp.org"
-    ntptime.timeout = 2  # CRITICAL: Prevents infinite hang if UDP packet drops!
+    ntptime.timeout = 2
     for _ in range(2):
         try:
             gc.collect()
             ntptime.settime()
-            set_accurate_epoch(time.time())
-            return True
+            if time.time() > MIN_VALID_EPOCH:
+                set_accurate_epoch(time.time())
+                return True
         except Exception as e:
             print("NTP sync attempt failed:", e)
             time.sleep_ms(200)
-    return False
+
+    # Fallback: pull UTC time from local Baby Buddy server's HTTP Date header
+    if sync_clock_from_baby_buddy():
+        return True
+
+    return is_clock_valid()
 
 
 def connect_wifi(sync_ntp=True):
-    """Connects to Wi-Fi reliably without re-instantiating or locking the CYW43 driver."""
+    """
+    Ensures GP29 is restored to PIO1 (alt=7) BEFORE waking the CYW43 chip
+    so wlan.active(True) never triggers a [CYW43] STALL!
+    """
+    global wlan, wlan_is_active
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
 
-    gc.collect()
+    wlan_is_active = True
     try:
-        if not wlan.active():
-            wlan.active(True)
-            time.sleep_ms(100)  # Give CYW43 radio time to wake up
+        Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
+    except Exception:
+        pass
+
+    gc.collect()
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    try:
         pm_perf = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11140)
         wlan.config(pm=pm_perf)
-    except Exception as e:
-        print("WLAN wake error:", e)
+    except Exception:
+        pass
 
     if wlan.isconnected():
-        try:
-            led.on()
-        except Exception:
-            pass
         if sync_ntp:
             sync_clock()
         return True
 
-    try:
-        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-    except Exception as e:
-        print("WLAN connect error:", e)
-        return False
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
     timeout = 24
     step = 0
     while not wlan.isconnected() and timeout > 0:
+        now_epoch()
         step += 1
         draw_modal(
             title="CONNECTING",
@@ -569,16 +717,14 @@ def connect_wifi(sync_ntp=True):
         timeout -= 1
 
     if wlan.isconnected():
-        try:
-            led.on()
-        except Exception:
-            pass
         if sync_ntp:
             sync_clock()
         return True
     else:
         if ENABLE_CPU_UNDERCLOCK:
             disable_wifi()
+        else:
+            wlan_is_active = False
         return False
 
 
@@ -663,19 +809,21 @@ def fetch_latest_feeding():
 
 def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
     """
-    Connects to Wi-Fi, syncs NTP, fetches the latest feeding from Baby Buddy,
-    shows a confirmation toast, and safely powers Wi-Fi back down.
+    Manually triggered ONLY when holding the button on the main screen:
+    connects to Wi-Fi, syncs NTP (or local HTTP Date fallback), fetches the
+    latest feeding from Baby Buddy, and powers Wi-Fi back down.
     """
+    global wlan_is_active
     draw_modal("REFRESHING", "LATEST...", "Connecting Wi-Fi", progress=0.25)
 
     if connect_wifi(sync_ntp=True):
         draw_modal("REFRESHING", "FETCHING", "Baby Buddy API", progress=0.75)
         latest = fetch_latest_feeding()
 
-        # Always power down Wi-Fi BEFORE showing the final toast & returning to main loop
         if ENABLE_CPU_UNDERCLOCK:
             disable_wifi()
         else:
+            wlan_is_active = False
             update_battery_status()
 
         if latest:
@@ -753,6 +901,12 @@ def verify_startup_config():
                     pass
             gc.collect()
 
+    # Ensure clock is synced (either via NTP or local Baby Buddy HTTP Date header)
+    if not is_clock_valid():
+        sync_clock_from_baby_buddy()
+    if not is_clock_valid():
+        halt_on_error("TIME ERROR", "NO CLOCK", "Check NTP/Server")
+
     draw_modal("STARTUP CHECK", "OK!", "Config Verified", progress=1.0)
     time.sleep_ms(1000)
 
@@ -765,6 +919,7 @@ def wait_for_all_released():
     """Waits for button release with a 2.5s safety timeout so a stuck pin never freezes the UI."""
     start_wait = time.ticks_ms()
     while any_button_pressed():
+        now_epoch()
         if time.ticks_diff(time.ticks_ms(), start_wait) > 2500:
             break
         time.sleep_ms(20)
@@ -862,7 +1017,7 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
 # 8. MAIN LOOP
 # =========================================================================
 def main():
-    global encoder_delta
+    global encoder_delta, wlan_is_active
     amount_oz = DEFAULT_OZ
     type_idx = 0
     start_epoch = 0
@@ -877,10 +1032,7 @@ def main():
     sw_press_start_ms = 0
     sw_long_handled = False
 
-    # Sample battery voltage right at boot before Wi-Fi starts
-    update_battery_status()
-
-    # 1. Verify config & sync NTP while Wi-Fi is active on boot
+    # 1. Verify config & sync NTP (or local Baby Buddy HTTP Date) on boot
     verify_startup_config()
 
     # 2. Fetch latest feeding BEFORE disabling Wi-Fi
@@ -894,16 +1046,18 @@ def main():
     if ENABLE_CPU_UNDERCLOCK:
         disable_wifi()
     else:
+        wlan_is_active = False
         update_battery_status()
 
     # Start on the idle dashboard (shows latest feeding & battery %)
     draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
     last_activity_ms = time.ticks_ms()
     last_footer_refresh_ms = time.ticks_ms()
+    last_sleep_batt_check_epoch = now_epoch()
 
     while True:
         now = time.ticks_ms()
-        now_epoch()  # Keep crystal-locked epoch counter updated
+        cur_epoch = now_epoch()  # Rolls _base_ticks_ms every second (prevents 6.2-day overflow)
 
         # 1. Sleep after 20s of inactivity on ANY screen (prevents battery drain)
         if screen_awake and time.ticks_diff(now, last_activity_ms) >= SLEEP_TIMEOUT_MS:
@@ -912,20 +1066,13 @@ def main():
             wizard_state = "idle"
             sw_pressed = False
             sw_long_handled = False
+            last_sleep_batt_check_epoch = now_epoch()
 
         # 2. Asleep loop: wake INSTANTLY using the crystal-locked clock
         if not screen_awake:
             if encoder_delta != 0 or any_button_pressed():
                 encoder_delta = 0
                 wake_from_sleep_mode()
-
-                # Only auto-connect Wi-Fi on wake if >4 hours since last sync
-                if (now_epoch() - _last_ntp_sync_epoch) >= AUTO_SYNC_INTERVAL_SEC:
-                    last_parent, last_oz, last_epoch = refresh_from_server(
-                        last_parent, last_oz, last_epoch, show_toast=False
-                    )
-                    encoder_delta = 0
-
                 screen_awake = True
                 wizard_state = "idle"
                 draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
@@ -936,7 +1083,13 @@ def main():
                 last_activity_ms = time.ticks_ms()
                 last_footer_refresh_ms = time.ticks_ms()
             else:
-                time.sleep_ms(50)
+                # Periodically check battery voltage every 30 mins during multi-day sleep
+                if (cur_epoch - last_sleep_batt_check_epoch) >= SLEEP_BATT_CHECK_SEC:
+                    last_sleep_batt_check_epoch = cur_epoch
+                    update_battery_status()
+                    if last_vsys_volts <= LOW_BATT_CUTOFF_VOLTS:
+                        enter_low_battery_cutoff(show_warning=False)
+                time.sleep_ms(100)
             continue
 
         # 3. Refresh the "Xm ago" footer & battery % every 15 seconds while idle
@@ -945,8 +1098,13 @@ def main():
             and time.ticks_diff(now, last_footer_refresh_ms) >= 15000
         ):
             update_battery_status()
-            draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
-            last_footer_refresh_ms = now
+            if last_vsys_volts <= LOW_BATT_CUTOFF_VOLTS:
+                enter_low_battery_cutoff(show_warning=True)
+                draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
+                last_activity_ms = time.ticks_ms()
+            else:
+                draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
+            last_footer_refresh_ms = time.ticks_ms()
 
         # 4. Rotary Encoder Turning
         if encoder_delta != 0:
