@@ -9,10 +9,10 @@ GitHub natively renders the Mermaid block below into a visual schematic:
 ```mermaid
 graph LR
     subgraph OLED["0.96'' SSD1306 OLED (I2C0)"]
-        O_SDA["SDA"]
-        O_SCL["SCL"]
         O_GND["GND"]
-        O_VCC["VCC"]
+        O_VDD["VDD"]
+        O_SCK["SCK"]
+        O_SDA["SDA"]
     end
 
     subgraph PICO["Raspberry Pi Pico W"]
@@ -47,10 +47,10 @@ graph LR
     end
 
     %% OLED Connections
-    O_SDA --- P6
-    O_SCL --- P7
     O_GND --- P8
-    O_VCC --- P36
+    O_VDD --- P36
+    O_SCK --- P7
+    O_SDA --- P6
 
     %% Encoder Connections
     P21 --- E_CLK
@@ -74,9 +74,9 @@ graph LR
                    GP1  | [ 2]               [39] | VSYS <---- [Backpack BAT]
                    GND  | [ 3]               [38] | GND  <---- [Backpack G]
                    GP2  | [ 4]               [37] | 3V3_EN
-                   GP3  | [ 5]               [36] | 3V3(OUT) -+--> [OLED VCC]
+                   GP3  | [ 5]               [36] | 3V3(OUT) -+--> [OLED VDD]
    [OLED SDA] <--> GP4  | [ 6]  TOP-LEFT     [35] | ADC_VREF  |
-   [OLED SCL] <--> GP5  | [ 7]  (OLED)       [34] | GP28      +--> [ENC +]
+   [OLED SCK] <--> GP5  | [ 7]  (OLED)       [34] | GP28      +--> [ENC +]
    [OLED GND] <--- GND  | [ 8]               [33] | GND (AGND)
                    GP6  | [ 9]               [32] | GP27
                    GP7  | [10]               [31] | GP26
@@ -98,10 +98,10 @@ graph LR
 ### A. 0.96" SSD1306 I2C OLED Display (Top-Left Corner)
 | Component Pin | Pico W GPIO | Physical Pin | Signal / Function |
 | :--- | :--- | :--- | :--- |
-| **SDA** | `GP4` | Pin 6 | `I2C0 SDA` (Data) |
-| **SCL** | `GP5` | Pin 7 | `I2C0 SCL` (Clock) |
 | **GND** | `GND` | Pin 8 | Ground |
-| **VCC** | `3V3(OUT)` | Pin 36 | 3.3V Logic Power (shared with Encoder `+`) |
+| **VDD** | `3V3(OUT)` | Pin 36 | 3.3V Logic Power (shared with Encoder `+`) |
+| **SCK** | `GP5` | Pin 7 | `I2C0 SCL` (Clock) |
+| **SDA** | `GP4` | Pin 6 | `I2C0 SDA` (Data) |
 
 ### B. KS0013 / KY-040 Rotary Encoder (Bottom-Right Corner)
 | Component Pin | Pico W GPIO | Physical Pin | Signal / Function |
@@ -110,7 +110,7 @@ graph LR
 | **DT** | `GP17` | Pin 22 | Quadrature Phase B (Direction sense) |
 | **GND** | `GND` | Pin 23 | Ground |
 | **SW** | `GP18` | Pin 24 | Pushbutton Switch (Active-Low w/ internal pull-up) |
-| **+** (VCC) | `3V3(OUT)` | Pin 36 | 3.3V Pull-up Reference (shared with OLED `VCC`) |
+| **+** (VCC) | `3V3(OUT)` | Pin 36 | 3.3V Pull-up Reference (shared with OLED `VDD`) |
 
 ### C. Adafruit LiIon/LiPoly Backpack (#2124) & Battery (Top-Right Corner)
 | Component Pin | Pico W GPIO | Physical Pin | Signal / Function |
@@ -120,17 +120,9 @@ graph LR
 | **G** | `GND` | Pin 38 | Common Ground |
 | **JST 2-Pin** | — | — | Connects directly to 3.7V 2500mAh LiPo pouch (#328) |
 
-### D. Optional Legacy Parent Buttons (Bottom-Left Corner)
-*If running the single-knob enclosure, these pins remain unconnected.*
-
-| Component Pin | Pico W GPIO | Physical Pin | Signal / Function |
-| :--- | :--- | :--- | :--- |
-| **Parent 1 NO** | `GP14` | Pin 19 | Parent 1 Trigger (Active-Low) |
-| **Parent 2 NO** | `GP15` | Pin 20 | Parent 2 Trigger (Active-Low) |
-| **Common GND** | `GND` | Pin 18 | Shared Button Ground |
 
 ## 4. Assembly & Wiring Notes
 
-* **3.3V Power Sharing (`Pin 36`):** Because the Pico W has a single `3V3(OUT)` header pin (`Pin 36`), use a 1-to-2 female DuPont Y-splitter jumper (or splice two female jumper leads together) to feed `3.3V` to both the OLED `VCC` and the KS0013 `+` pin.
-* **Encoder Direction Inversion:** If rotating the knob clockwise decreases the ounce value, swap the DuPont jumpers on **Pin 21 (`GP16`)** and **Pin 22 (`GP17`)**, or swap `ENC_CLK_PIN` and `ENC_DT_PIN` in `main.py`.
-* **Schottky Diode Protection (When Using LiPo Backpack):** If plugging into USB while the LiPo is connected to `VSYS`, ensure a Schottky diode (such as a `1N5817` or `MBR120`) is placed inline between the Backpack `BAT` pin and Pico `VSYS` (`Pin 39`)—anode to `BAT`, cathode (striped end) to `VSYS`—per Raspberry Pi Pico W datasheet guidelines so `VBUS` (5V) does not back-feed directly into the battery prior to the charger circuit.
+- **3.3V Power Sharing (`Pin 36`):** Because the Pico W has a single `3V3(OUT)` header pin (`Pin 36`), use a 1-to-2 female DuPont Y-splitter jumper (or splice two female jumper leads together) to feed `3.3V` to both the OLED `VDD` and the KS0013 `+` pin.
+- **Encoder Direction Inversion:** If rotating the knob clockwise decreases the ounce value, swap the DuPont jumpers on **Pin 21 (`GP16`)** and **Pin 22 (`GP17`)**, or swap `ENC_CLK_PIN` and `ENC_DT_PIN` in `main.py`[cite: 1, 2].
+- **Schottky Diode Protection (When Using LiPo Backpack):** If plugging into USB while the LiPo is connected to `VSYS`, ensure a Schottky diode (such as a `1N5817` or `MBR120`) is placed inline between the Backpack `BAT` pin and Pico `VSYS` (`Pin 39`)—anode to `BAT`, cathode (striped end) to `VSYS`—per Raspberry Pi Pico W datasheet guidelines so `VBUS` (5V) does not back-feed directly into the battery prior to the charger circuit.

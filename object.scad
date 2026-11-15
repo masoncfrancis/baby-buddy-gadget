@@ -333,83 +333,79 @@ module top_lid() {
 }
 
 // =========================================================================
-// 3. STEPPED M3 CLAMP BARS (Includes Full-Width Recessed OLED Bridge Clamp!)
+// 3. LOW-PROFILE M3 CLAMP BARS (Flat Underside on OLED Clamp!)
 // =========================================================================
 module clamp_bars_set() {
-    // 1. Encoder Bridge Clamp Bar
+    // 1. Encoder Bridge Clamp Bar (1.2mm thin screw ends + 2.0mm stiff center bridge)
     enc_span = ks0013_pcb_w + 2 * m3_edge_off;
     difference() {
         union() {
             hull() {
-                translate([0, -enc_span/2, 0]) cylinder(d=7.0, h=2.2);
-                translate([0,  enc_span/2, 0]) cylinder(d=7.0, h=2.2);
+                translate([0, -enc_span/2, 0]) cylinder(d=7.0, h=2.0);
+                translate([0,  enc_span/2, 0]) cylinder(d=7.0, h=2.0);
             }
-            translate([-3.5, -(ks0013_pcb_w - 1.0)/2, 2.2])
+            translate([-3.5, -(ks0013_pcb_w - 1.0)/2, 2.0])
                 cube([7.0, ks0013_pcb_w - 1.0, 0.5]);
         }
         translate([0, -enc_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
         translate([0,  enc_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
+        translate([0, -enc_span/2, -0.1]) cylinder(d=6.4, h=1.0);
+        translate([0,  enc_span/2, -0.1]) cylinder(d=6.4, h=1.0);
     }
 
-    // 2. Pico End Clamp Bar
+    // 2. Pico End Clamp Bar (1.1mm thin screw flanges)
     translate([10, 0, 0]) {
         difference() {
             hull() {
-                translate([0, -4.5, 0]) cylinder(d=6.8, h=2.2);
-                translate([0,  4.5, 0]) cylinder(d=6.8, h=2.2);
+                translate([0, -4.5, 0]) cylinder(d=6.8, h=1.8);
+                translate([0,  4.5, 0]) cylinder(d=6.8, h=1.8);
             }
             translate([0, -4.5, -0.1]) cylinder(d=m3_clear_dia, h=3.0);
             translate([0,  4.5, -0.1]) cylinder(d=m3_clear_dia, h=3.0);
+            translate([0, -4.5, -0.1]) cylinder(d=6.2, h=0.8);
+            translate([0,  4.5, -0.1]) cylinder(d=6.2, h=0.8);
         }
     }
 
-    // 3. Horizontal Backpack Bridge Clamp Bar
+    // 3. Horizontal Backpack Bridge Clamp Bar (1.1mm thin screw flanges)
     bp_span = bp_horiz_x + 2 * m3_edge_off;
     translate([20, 0, 0]) {
         difference() {
             union() {
                 hull() {
-                    translate([0, -bp_span/2, 0]) cylinder(d=6.8, h=2.2);
-                    translate([0,  bp_span/2, 0]) cylinder(d=6.8, h=2.2);
+                    translate([0, -bp_span/2, 0]) cylinder(d=6.8, h=2.0);
+                    translate([0,  bp_span/2, 0]) cylinder(d=6.8, h=2.0);
                 }
-                translate([-3.4, -(bp_horiz_x - 1.0)/2, 2.2])
+                translate([-3.4, -(bp_horiz_x - 1.0)/2, 2.0])
                     cube([6.8, bp_horiz_x - 1.0, 0.5]);
             }
             translate([0, -bp_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
             translate([0,  bp_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
+            translate([0, -bp_span/2, -0.1]) cylinder(d=6.2, h=1.0);
+            translate([0,  bp_span/2, -0.1]) cylinder(d=6.2, h=1.0);
         }
     }
 
-    // 4. NEW: SSD1306 OLED Full-Width Bridge Clamp Bar (Spans both side M3 towers!)
-    // Features two 0.5mm edge pinch pads that press the outer 2.2mm left/right margins
-    // of the OLED PCB, while arching over the SMD components in the center of the board!
+    // 4. COMPLETELY FLAT SSD1306 OLED Bridge Clamp Bar
+    // Flat underside from end to end (zero raised pads) with 1.0mm thin counterbored screw ends!
     oled_span = oled_pcb_w + 2 * m3_edge_off; // 31.6mm center-to-center hole span
     translate([31, 0, 0]) {
         difference() {
-            union() {
-                // Main structural bridge bar (8mm wide for anti-rocking stability)
-                hull() {
-                    translate([0, -oled_span/2, 0]) cylinder(d=8.0, h=2.4);
-                    translate([0,  oled_span/2, 0]) cylinder(d=8.0, h=2.4);
-                }
-                // Left & Right 0.5mm stepped pinch pads (contacts only the outer 2.2mm PCB edges)
-                for (side = [-1, 1]) {
-                    pad_y = (side == -1) ? (-oled_pcb_w/2 + 0.2) : (oled_pcb_w/2 - 2.4);
-                    translate([-4.0, pad_y, 2.4])
-                        cube([8.0, 2.2, 0.5]);
-                }
+            // Flat 1.6mm bar with a completely smooth bottom and top
+            hull() {
+                translate([0, -oled_span/2, 0]) cylinder(d=7.6, h=1.6);
+                translate([0,  oled_span/2, 0]) cylinder(d=7.6, h=1.6);
             }
             // M3 screw clearance holes
-            translate([0, -oled_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
-            translate([0,  oled_span/2, -0.1]) cylinder(d=m3_clear_dia, h=3.5);
+            translate([0, -oled_span/2, -0.1]) cylinder(d=m3_clear_dia, h=2.0);
+            translate([0,  oled_span/2, -0.1]) cylinder(d=m3_clear_dia, h=2.0);
 
-            // Center SMD component relief channel (clears resistors/caps on back of OLED PCB)
-            translate([-4.5, -(oled_pcb_w - 5.2)/2, 1.8])
-                cube([9.0, oled_pcb_w - 5.2, 2.0]);
+            // Top counterbore pockets for screw heads (leaves 1.0mm flange thickness so short screws reach!)
+            translate([0, -oled_span/2, 1.0]) cylinder(d=6.4, h=1.0);
+            translate([0,  oled_span/2, 1.0]) cylinder(d=6.4, h=1.0);
         }
     }
 }
-
 // =========================================================================
 // 4. KNURLED D-SHAFT KNOB (24 x 14mm Low-Profile)
 // =========================================================================
