@@ -7,7 +7,7 @@ import ntptime
 import machine
 import framebuf
 import gc
-from machine import Pin, I2C, ADC
+from machine import Pin, I2C, ADC, WDT
 from ssd1306 import SSD1306_I2C
 
 
@@ -110,14 +110,13 @@ clk_pin = Pin(ENC_CLK_PIN, Pin.IN, Pin.PULL_UP)
 dt_pin = Pin(ENC_DT_PIN, Pin.IN, Pin.PULL_UP)
 sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
 
+# Instantiate WLAN once globally and NEVER call wlan.deinit()!
 wlan = network.WLAN(network.STA_IF)
 wlan_is_active = False
 cached_batt_label = "--%"
 last_vsys_volts = 4.00
 
 # --- HARDWARE CRYSTAL MONOTONIC CLOCK ---
-# Continuously rolls over _base_ticks_ms every second (both awake and asleep)
-# so time.ticks_diff() never approaches the 6.2-day 30-bit wraparound limit!
 _base_epoch = time.time()
 _base_ticks_ms = time.ticks_ms()
 _remainder_ms = 0
@@ -141,7 +140,6 @@ def now_epoch():
         _remainder_ms = total_ms % 1000
         _base_ticks_ms = now_t
     elif diff_ms < 0:
-        # Safety guard if ticks_ms ever wraps unexpectedly
         _base_ticks_ms = now_t
     return _base_epoch
 
@@ -175,8 +173,21 @@ def rotary_isr(pin):
 clk_pin.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=rotary_isr)
 
 
-# --- BACKGROUND 7-SECOND HARD RESET MONITOR ---
+# --- SILICON WATCHDOG + 7-SECOND HARD RESET MONITOR ---
+# 1. If the CPU ever hard-locks in a C driver (interrupts disabled), the RP2040
+#    hardware watchdog (WDT) automatically resets the silicon after 8.3 seconds!
+# 2. If the user holds the knob for 7 seconds, _check_emergency_reset() forces
+#    an immediate machine.reset().
+_wdt = None
 _reset_hold_ticks = 0
+
+
+def feed_wdt():
+    if _wdt is not None and _reset_hold_ticks < HARD_RESET_HOLD_TICKS:
+        try:
+            _wdt.feed()
+        except Exception:
+            pass
 
 
 def _check_emergency_reset(timer):
@@ -187,6 +198,7 @@ def _check_emergency_reset(timer):
             machine.reset()
     else:
         _reset_hold_ticks = 0
+    feed_wdt()
 
 
 _reset_timer = machine.Timer(-1)
@@ -197,16 +209,19 @@ _reset_timer.init(
 
 def update_battery_status():
     """
-    Safely reads VSYS on Pico W without causing [CYW43] STALL(0;165-165):
+    Safely reads VSYS on Pico W WITHOUT needing wlan.deinit():
     1. Only runs when Wi-Fi is inactive.
-    2. Temporarily switches GP29 to ADC input, reads VSYS, and IMMEDIATELY
-       restores GP29 to PIO1 (Pin.ALT, alt=7) so CYW43 SPI never stalls!
+    2. Briefly drives GP25 HIGH for 2ms to open the VSYS/3 FET gate, samples ADC(29),
+       and IMMEDIATELY restores BOTH GP25 and GP29 to PIO1 (Pin.ALT, alt=7).
     """
     global cached_batt_label, last_vsys_volts
     if wlan_is_active:
         return cached_batt_label
     try:
-        Pin(29, Pin.IN)
+        Pin(25, Pin.OUT, value=1)
+        Pin(29, Pin.IN, pull=None)
+        time.sleep_ms(2)
+
         adc = ADC(29)
         raw = sum(adc.read_u16() for _ in range(5)) / 5
         vsys = (raw * 3.3 / 65535) * 3.0
@@ -221,8 +236,11 @@ def update_battery_status():
     except Exception as e:
         print("Battery ADC read error:", e)
     finally:
+        # CRITICAL: Restore BOTH GP25 (CS) and GP29 (DIO) to PIO1 (alt=7)
+        # so the CYW43 SPI bus never stalls or deadlocks!
         try:
             Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
+            Pin(25, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
         except Exception:
             pass
     return cached_batt_label
@@ -463,6 +481,7 @@ def halt_on_error(title, big_line, sub_line):
     screen_on = True
     while True:
         now_epoch()
+        feed_wdt()
         if screen_on and time.ticks_diff(time.ticks_ms(), start_ms) > ERROR_SLEEP_TIMEOUT_MS:
             oled.poweroff()
             if ENABLE_CPU_UNDERCLOCK:
@@ -489,19 +508,19 @@ def halt_on_error(title, big_line, sub_line):
 # =========================================================================
 def disable_wifi():
     """
-    Powers down Wi-Fi via wlan.deinit(), waits for the CYW43 SPI bus to settle,
-    samples ADC(29), and restores GP29 to PIO1 (alt=7).
+    Safely puts Wi-Fi radio to sleep WITHOUT calling wlan.deinit()!
+    Calling wlan.deinit() right after closing a TCP socket deadlocks the RP2040
+    CYW43 driver with interrupts disabled.
     """
     global wlan_is_active
     try:
         if wlan.isconnected():
             wlan.disconnect()
         wlan.active(False)
-        wlan.deinit()
-    except Exception:
-        pass
+    except Exception as e:
+        print("Wi-Fi disable error:", e)
     wlan_is_active = False
-    time.sleep_ms(30)
+    time.sleep_ms(50)  # Let lwIP & CYW43 finish background socket cleanup
     update_battery_status()
     gc.collect()
 
@@ -530,7 +549,8 @@ def enter_low_battery_cutoff(show_warning=True):
     last_check_ms = time.ticks_ms()
 
     while True:
-        now_epoch()  # Keep monotonic clock ticking accurately even during hibernate!
+        now_epoch()
+        feed_wdt()
         now = time.ticks_ms()
 
         # Check every 2 seconds if USB cable was plugged in
@@ -538,7 +558,6 @@ def enter_low_battery_cutoff(show_warning=True):
             last_check_ms = now
             update_battery_status()
             if last_vsys_volts >= LOW_BATT_RECOVER_VOLTS:
-                # Battery is charging or above recovery threshold! Wake back up:
                 if ENABLE_CPU_UNDERCLOCK:
                     machine.freq(FREQ_ACTIVE)
                 oled.poweron()
@@ -616,7 +635,6 @@ def sync_clock_from_baby_buddy():
             if not line or line == b"\r\n":
                 break
             if line.lower().startswith(b"date:"):
-                # Example: b'Date: Sun, 15 Nov 2026 05:45:12 GMT\r\n'
                 parts = line.decode().strip().split()
                 if len(parts) >= 6:
                     day = int(parts[2])
@@ -656,6 +674,7 @@ def sync_clock():
     for _ in range(2):
         try:
             gc.collect()
+            feed_wdt()
             ntptime.settime()
             if time.time() > MIN_VALID_EPOCH:
                 set_accurate_epoch(time.time())
@@ -664,7 +683,6 @@ def sync_clock():
             print("NTP sync attempt failed:", e)
             time.sleep_ms(200)
 
-    # Fallback: pull UTC time from local Baby Buddy server's HTTP Date header
     if sync_clock_from_baby_buddy():
         return True
 
@@ -673,22 +691,25 @@ def sync_clock():
 
 def connect_wifi(sync_ntp=True):
     """
-    Ensures GP29 is restored to PIO1 (alt=7) BEFORE waking the CYW43 chip
-    so wlan.active(True) never triggers a [CYW43] STALL!
+    Ensures GP25 & GP29 are restored to PIO1 (alt=7) BEFORE waking the CYW43 chip
+    and reuses the global wlan instance without ever calling wlan.deinit()!
     """
-    global wlan, wlan_is_active
+    global wlan_is_active
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
 
     wlan_is_active = True
     try:
         Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
+        Pin(25, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
     except Exception:
         pass
 
     gc.collect()
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+    feed_wdt()
+    if not wlan.active():
+        wlan.active(True)
+        time.sleep_ms(80)
     try:
         pm_perf = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11140)
         wlan.config(pm=pm_perf)
@@ -706,6 +727,7 @@ def connect_wifi(sync_ntp=True):
     step = 0
     while not wlan.isconnected() and timeout > 0:
         now_epoch()
+        feed_wdt()
         step += 1
         draw_modal(
             title="CONNECTING",
@@ -768,6 +790,7 @@ def fetch_latest_feeding():
     }
     response = None
     gc.collect()
+    feed_wdt()
     try:
         try:
             response = urequests.get(url, headers=headers, timeout=5)
@@ -868,6 +891,7 @@ def verify_startup_config():
         }
         response = None
         gc.collect()
+        feed_wdt()
         try:
             try:
                 response = urequests.get(url, headers=headers, timeout=5)
@@ -920,6 +944,7 @@ def wait_for_all_released():
     start_wait = time.ticks_ms()
     while any_button_pressed():
         now_epoch()
+        feed_wdt()
         if time.ticks_diff(time.ticks_ms(), start_wait) > 2500:
             break
         time.sleep_ms(20)
@@ -974,7 +999,10 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
 
     response = None
     success = False
+    status_code = 0
+    err_text = ""
     gc.collect()
+    feed_wdt()
     try:
         body = ujson.dumps(payload)
         try:
@@ -982,33 +1010,42 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
         except TypeError:
             response = urequests.post(url, headers=headers, data=body)
 
-        if response.status_code in (200, 201):
-            draw_modal(
-                title="FEEDING SAVED",
-                big_line="SENT!",
-                sub_line=f"{parent['name']} - {format_oz(amount_oz)} oz",
-                progress=1.0,
-            )
+        status_code = response.status_code
+        if status_code in (200, 201):
             success = True
-            time.sleep_ms(1800)
         else:
-            print("API Error:", response.status_code, response.text)
-            halt_on_error(
-                "API ERROR", f"ERR {response.status_code}", "Check Tag/Config"
-            )
+            err_text = response.text
     except Exception as e:
         print("Request Exception:", e)
-        draw_modal("SERVER ERROR", "OFFLINE", "Cannot reach API")
-        time.sleep_ms(2500)
+        status_code = -1
     finally:
+        # 1. Close socket FIRST while Wi-Fi is still active
         if response:
             try:
                 response.close()
             except Exception:
                 pass
-        if ENABLE_CPU_UNDERCLOCK:
-            disable_wifi()
         gc.collect()
+
+    # 2. Power down Wi-Fi cleanly (without wlan.deinit()) BEFORE drawing final modal
+    if ENABLE_CPU_UNDERCLOCK:
+        disable_wifi()
+
+    # 3. Show result modal after Wi-Fi is safely asleep
+    if success:
+        draw_modal(
+            title="FEEDING SAVED",
+            big_line="SENT!",
+            sub_line=f"{parent['name']} - {format_oz(amount_oz)} oz",
+            progress=1.0,
+        )
+        time.sleep_ms(1500)
+    elif status_code == -1:
+        draw_modal("SERVER ERROR", "OFFLINE", "Cannot reach API")
+        time.sleep_ms(2500)
+    else:
+        print("API Error:", status_code, err_text)
+        halt_on_error("API ERROR", f"ERR {status_code}", "Check Tag/Config")
 
     return success
 
@@ -1017,7 +1054,7 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
 # 8. MAIN LOOP
 # =========================================================================
 def main():
-    global encoder_delta, wlan_is_active
+    global encoder_delta, wlan_is_active, _wdt
     amount_oz = DEFAULT_OZ
     type_idx = 0
     start_epoch = 0
@@ -1031,6 +1068,10 @@ def main():
     sw_pressed = False
     sw_press_start_ms = 0
     sw_long_handled = False
+
+    # Enable RP2040 Silicon Watchdog (8.3s timeout) so even a hard C-level
+    # interrupt lockup automatically resets the board!
+    _wdt = WDT(timeout=8300)
 
     # 1. Verify config & sync NTP (or local Baby Buddy HTTP Date) on boot
     verify_startup_config()
@@ -1057,7 +1098,8 @@ def main():
 
     while True:
         now = time.ticks_ms()
-        cur_epoch = now_epoch()  # Rolls _base_ticks_ms every second (prevents 6.2-day overflow)
+        cur_epoch = now_epoch()
+        feed_wdt()
 
         # 1. Sleep after 20s of inactivity on ANY screen (prevents battery drain)
         if screen_awake and time.ticks_diff(now, last_activity_ms) >= SLEEP_TIMEOUT_MS:
@@ -1083,7 +1125,6 @@ def main():
                 last_activity_ms = time.ticks_ms()
                 last_footer_refresh_ms = time.ticks_ms()
             else:
-                # Periodically check battery voltage every 30 mins during multi-day sleep
                 if (cur_epoch - last_sleep_batt_check_epoch) >= SLEEP_BATT_CHECK_SEC:
                     last_sleep_batt_check_epoch = cur_epoch
                     update_battery_status()
@@ -1148,18 +1189,16 @@ def main():
             elif not sw_long_handled and time.ticks_diff(now, sw_press_start_ms) >= LONG_PRESS_MS:
                 sw_long_handled = True
                 if wizard_state != "idle":
-                    # Cancel wizard from any menu step and return to main screen
                     draw_modal("CANCELLED", "EXIT", "Back to main", progress=None)
                     time.sleep_ms(600)
                 else:
-                    # Held on main screen: connect Wi-Fi, sync time & refresh latest feed!
                     last_parent, last_oz, last_epoch = refresh_from_server(
                         last_parent, last_oz, last_epoch, show_toast=True
                     )
                 wizard_state = "idle"
                 draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
                 wait_for_all_released()
-                encoder_delta = 0  # Clear any accidental knob movement during button release
+                encoder_delta = 0
                 sw_pressed = False
                 sw_long_handled = False
                 last_activity_ms = time.ticks_ms()
