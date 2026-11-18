@@ -115,6 +115,12 @@ wlan_is_active = False
 cached_batt_label = "--%"
 last_vsys_volts = 4.00
 
+
+def _diag_flow(event, detail=""):
+    """Emit low-volume, credential-free markers for diagnosing blocked flows."""
+    print("[DBG-FLOW] %s t=%d %s" % (event, time.ticks_ms(), detail))
+
+
 # --- HARDWARE CRYSTAL MONOTONIC CLOCK ---
 # Continuously rolls over _base_ticks_ms every second (both awake and asleep)
 # so time.ticks_diff() never approaches the 6.2-day 30-bit wraparound limit!
@@ -455,6 +461,7 @@ def draw_modal(title, big_line, sub_line="", progress=None):
 def halt_on_error(title, big_line, sub_line):
     global encoder_delta
     print(f"FATAL CONFIG ERROR: {title} | {big_line} | {sub_line}")
+    _diag_flow("halt_on_error", title)
     if ENABLE_CPU_UNDERCLOCK:
         disable_wifi()
     draw_modal(title, big_line, sub_line, progress=None)
@@ -493,6 +500,7 @@ def disable_wifi():
     samples ADC(29), and restores GP29 to PIO1 (alt=7).
     """
     global wlan_is_active
+    _diag_flow("wifi_disable_begin")
     try:
         if wlan.isconnected():
             wlan.disconnect()
@@ -504,6 +512,7 @@ def disable_wifi():
     time.sleep_ms(30)
     update_battery_status()
     gc.collect()
+    _diag_flow("wifi_disable_end")
 
 
 def enter_low_battery_cutoff(show_warning=True):
@@ -649,8 +658,10 @@ def sync_clock():
        directly from the local Baby Buddy server on your LAN!
     """
     if not wlan.isconnected():
+        _diag_flow("clock_sync_skipped", "wifi_disconnected")
         return False
 
+    _diag_flow("clock_sync_begin")
     ntptime.host = "pool.ntp.org"
     ntptime.timeout = 2
     for _ in range(2):
@@ -659,6 +670,7 @@ def sync_clock():
             ntptime.settime()
             if time.time() > MIN_VALID_EPOCH:
                 set_accurate_epoch(time.time())
+                _diag_flow("clock_sync_end", "ntp_ok")
                 return True
         except Exception as e:
             print("NTP sync attempt failed:", e)
@@ -666,9 +678,12 @@ def sync_clock():
 
     # Fallback: pull UTC time from local Baby Buddy server's HTTP Date header
     if sync_clock_from_baby_buddy():
+        _diag_flow("clock_sync_end", "baby_buddy_ok")
         return True
 
-    return is_clock_valid()
+    valid = is_clock_valid()
+    _diag_flow("clock_sync_end", "valid=%s" % valid)
+    return valid
 
 
 def connect_wifi(sync_ntp=True):
@@ -677,6 +692,7 @@ def connect_wifi(sync_ntp=True):
     so wlan.active(True) never triggers a [CYW43] STALL!
     """
     global wlan, wlan_is_active
+    _diag_flow("wifi_connect_begin", "sync_ntp=%s" % sync_ntp)
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
 
@@ -698,8 +714,10 @@ def connect_wifi(sync_ntp=True):
     if wlan.isconnected():
         if sync_ntp:
             sync_clock()
+        _diag_flow("wifi_connect_end", "already_connected")
         return True
 
+    _diag_flow("wifi_associate_begin")
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
     timeout = 24
@@ -719,8 +737,10 @@ def connect_wifi(sync_ntp=True):
     if wlan.isconnected():
         if sync_ntp:
             sync_clock()
+        _diag_flow("wifi_connect_end", "connected")
         return True
     else:
+        _diag_flow("wifi_connect_end", "timeout")
         if ENABLE_CPU_UNDERCLOCK:
             disable_wifi()
         else:
@@ -936,11 +956,17 @@ def format_iso_time(epoch_secs):
 
 def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
     parent = PARENTS[parent_key]
+    _diag_flow(
+        "submit_begin",
+        "parent=%s amount=%s" % (parent_key, format_oz(amount_oz)),
+    )
 
     if not connect_wifi(sync_ntp=True):
+        _diag_flow("submit_wifi_failed")
         draw_modal("WIFI FAILED", "NO NET", "Check Router", progress=0.0)
         time.sleep_ms(2500)
         return False
+    _diag_flow("submit_wifi_ready")
 
     draw_modal(
         title=f"LOGGING ({parent['name'].upper()})",
@@ -977,10 +1003,13 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
     gc.collect()
     try:
         body = ujson.dumps(payload)
+        _diag_flow("post_begin")
         try:
             response = urequests.post(url, headers=headers, data=body, timeout=6)
         except TypeError:
+            _diag_flow("post_timeout_unsupported", "retrying_without_timeout")
             response = urequests.post(url, headers=headers, data=body)
+        _diag_flow("post_return", "status=%s" % response.status_code)
 
         if response.status_code in (200, 201):
             draw_modal(
@@ -997,19 +1026,25 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
                 "API ERROR", f"ERR {response.status_code}", "Check Tag/Config"
             )
     except Exception as e:
+        _diag_flow("post_exception", type(e).__name__)
         print("Request Exception:", e)
         draw_modal("SERVER ERROR", "OFFLINE", "Cannot reach API")
         time.sleep_ms(2500)
     finally:
         if response:
             try:
+                _diag_flow("response_close_begin")
                 response.close()
+                _diag_flow("response_close_end")
             except Exception:
+                _diag_flow("response_close_exception")
                 pass
         if ENABLE_CPU_UNDERCLOCK:
+            _diag_flow("submit_wifi_cleanup_begin")
             disable_wifi()
         gc.collect()
 
+    _diag_flow("submit_end", "success=%s" % success)
     return success
 
 
@@ -1211,4 +1246,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
