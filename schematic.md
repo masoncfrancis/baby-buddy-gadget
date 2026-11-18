@@ -74,9 +74,10 @@ graph LR
                    GP1  | [ 2]               [39] | VSYS <---- [Backpack BAT]
                    GND  | [ 3]               [38] | GND  <---- [Backpack G]
                    GP2  | [ 4]               [37] | 3V3_EN
-                   GP3  | [ 5]               [36] | 3V3(OUT) -+--> [OLED VDD]
-   [OLED SDA] <--> GP4  | [ 6]  TOP-LEFT     [35] | ADC_VREF  |
-   [OLED SCK] <--> GP5  | [ 7]  (OLED)       [34] | GP28      +--> [ENC +]
+                    GP3  | [ 5]               [36] | 3V3(OUT) -+--> [OLED VDD]
+                                                            `--> [ENC +]
+    [OLED SDA] <--> GP4  | [ 6]  TOP-LEFT     [35] | ADC_VREF  |
+    [OLED SCK] <--> GP5  | [ 7]  (OLED)       [34] | GP28
    [OLED GND] <--- GND  | [ 8]               [33] | GND (AGND)
                    GP6  | [ 9]               [32] | GP27
                    GP7  | [10]               [31] | GP26

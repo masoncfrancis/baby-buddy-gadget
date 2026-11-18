@@ -1,7 +1,5 @@
 import network
-import urequests
 import ujson
-import usocket
 import time
 import ntptime
 import machine
@@ -9,6 +7,14 @@ import framebuf
 import gc
 from machine import Pin, I2C, ADC
 from ssd1306 import SSD1306_I2C
+import http_client
+from app_config import (
+    child_id_matches,
+    load_env_lines,
+    parse_child_id,
+    parse_timezone_offset,
+    validate_config,
+)
 
 
 # =========================================================================
@@ -17,11 +23,7 @@ from ssd1306 import SSD1306_I2C
 env = {}
 try:
     with open(".env", "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, val = line.split("=", 1)
-                env[key.strip()] = val.strip()
+        env = load_env_lines(f)
 except OSError:
     print("WARNING: .env file not found on board!")
 
@@ -29,18 +31,14 @@ ENABLE_CPU_UNDERCLOCK = True
 
 WIFI_SSID = env.get("WIFI_SSID", "")
 WIFI_PASSWORD = env.get("WIFI_PASSWORD", "")
-BABY_BUDDY_BASE_URL = env.get("BABY_BUDDY_BASE_URL", "http://192.168.1.100:8000")
+BABY_BUDDY_BASE_URL = env.get("BABY_BUDDY_BASE_URL", "")
 CHILD_SLUG = env.get("CHILD_SLUG", "")
 
-try:
-    TIMEZONE_OFFSET_MINUTES = int(env.get("TIMEZONE_OFFSET_MINUTES", "0"))
-except ValueError:
-    TIMEZONE_OFFSET_MINUTES = 0
+TIMEZONE_OFFSET_MINUTES = parse_timezone_offset(
+    env.get("TIMEZONE_OFFSET_MINUTES", "0")
+)
 
-try:
-    CHILD_ID = int(env.get("CHILD_ID", "1"))
-except ValueError:
-    CHILD_ID = 1
+CHILD_ID = parse_child_id(env.get("CHILD_ID"))
 
 # =========================================================================
 # 2. HARDWARE PINOUT & PARENT CONFIGURATION
@@ -112,6 +110,8 @@ sw_pin = Pin(ENC_SW_PIN, Pin.IN, Pin.PULL_UP)
 
 wlan = network.WLAN(network.STA_IF)
 wlan_is_active = False
+# True only after wlan.active(False), wlan.active() == False, and deinit succeed.
+wifi_shutdown_confirmed = False
 cached_batt_label = "--%"
 last_vsys_volts = 4.00
 
@@ -203,14 +203,13 @@ _reset_timer.init(
 
 def update_battery_status():
     """
-    Safely reads VSYS on Pico W without causing [CYW43] STALL(0;165-165):
-    1. Only runs when Wi-Fi is inactive.
-    2. Temporarily switches GP29 to ADC input, reads VSYS, and IMMEDIATELY
-       restores GP29 to PIO1 (Pin.ALT, alt=7) so CYW43 SPI never stalls!
+    Read VSYS only after confirmed WLAN shutdown. GP29 is shared by Pico W's
+    wireless SPI clock and ADC3; restore its wireless pin mux even on ADC error.
     """
     global cached_batt_label, last_vsys_volts
-    if wlan_is_active:
+    if wlan_is_active or not wifi_shutdown_confirmed:
         return cached_batt_label
+    restore_ok = False
     try:
         Pin(29, Pin.IN)
         adc = ADC(29)
@@ -229,8 +228,11 @@ def update_battery_status():
     finally:
         try:
             Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
+            restore_ok = True
         except Exception:
-            pass
+            print("GP29 wireless pin restore failed")
+    if not restore_ok:
+        _diag_flow("gp29_restore_failed")
     return cached_batt_label
 
 
@@ -462,8 +464,7 @@ def halt_on_error(title, big_line, sub_line):
     global encoder_delta
     print(f"FATAL CONFIG ERROR: {title} | {big_line} | {sub_line}")
     _diag_flow("halt_on_error", title)
-    if ENABLE_CPU_UNDERCLOCK:
-        disable_wifi()
+    disable_wifi()
     draw_modal(title, big_line, sub_line, progress=None)
 
     start_ms = time.ticks_ms()
@@ -494,25 +495,48 @@ def halt_on_error(title, big_line, sub_line):
 # =========================================================================
 # 6. POWER MANAGEMENT, LOW-BATTERY CUTOFF & WIFI
 # =========================================================================
-def disable_wifi():
+def disable_wifi(sample_battery=True):
     """
-    Powers down Wi-Fi via wlan.deinit(), waits for the CYW43 SPI bus to settle,
-    samples ADC(29), and restores GP29 to PIO1 (alt=7).
+    Confirm radio shutdown before allowing GP29 battery ADC sampling.
+
+    Shutdown details are Pico W / MicroPython-specific and empirically tested;
+    keep direct GP25 manipulation out of this path.
     """
-    global wlan_is_active
+    global wlan_is_active, wifi_shutdown_confirmed
     _diag_flow("wifi_disable_begin")
+    if wifi_shutdown_confirmed:
+        time.sleep_ms(30)
+        if sample_battery:
+            update_battery_status()
+        gc.collect()
+        _diag_flow("wifi_disable_end", "already_confirmed")
+        return True
+
     try:
         if wlan.isconnected():
-            wlan.disconnect()
+            try:
+                wlan.disconnect()
+            except Exception:
+                pass
         wlan.active(False)
+        if wlan.active():
+            raise RuntimeError("WLAN remained active")
         wlan.deinit()
-    except Exception:
-        pass
+    except Exception as e:
+        # Unknown radio state means no ADC(29) access.
+        wlan_is_active = True
+        wifi_shutdown_confirmed = False
+        _diag_flow("wifi_disable_failed", type(e).__name__)
+        return False
+
     wlan_is_active = False
+    wifi_shutdown_confirmed = True
     time.sleep_ms(30)
-    update_battery_status()
+    if sample_battery:
+        update_battery_status()
     gc.collect()
     _diag_flow("wifi_disable_end")
+    return True
 
 
 def enter_low_battery_cutoff(show_warning=True):
@@ -523,7 +547,8 @@ def enter_low_battery_cutoff(show_warning=True):
     - Automatically wakes back up as soon as USB power is connected (VSYS > 3.50V)!
     """
     global encoder_delta
-    disable_wifi()
+    if not disable_wifi():
+        halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Battery safety")
 
     if show_warning:
         if ENABLE_CPU_UNDERCLOCK:
@@ -579,8 +604,9 @@ def enter_low_battery_cutoff(show_warning=True):
 def enter_sleep_mode():
     now_epoch()
     oled.poweroff()
+    if not disable_wifi():
+        halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Battery safety")
     if ENABLE_CPU_UNDERCLOCK:
-        disable_wifi()
         machine.freq(FREQ_IDLE)
     if last_vsys_volts <= LOW_BATT_CUTOFF_VOLTS:
         enter_low_battery_cutoff(show_warning=False)
@@ -602,49 +628,36 @@ def sync_clock_from_baby_buddy():
     Reads the HTTP 'Date: Sun, 15 Nov 2026 05:45:12 GMT' header directly
     from the local Baby Buddy server over LAN!
     """
-    s = None
+    response = None
     gc.collect()
     try:
-        clean_url = BABY_BUDDY_BASE_URL.split("://")[-1].split("/")[0]
-        if ":" in clean_url:
-            host, port_str = clean_url.split(":", 1)
-            port = int(port_str)
-        else:
-            host = clean_url
-            port = 80
-
-        addr = usocket.getaddrinfo(host, port)[0][-1]
-        s = usocket.socket()
-        s.settimeout(2)
-        s.connect(addr)
-        req = f"HEAD /api/ HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        s.send(req.encode())
-
-        while True:
-            line = s.readline()
-            if not line or line == b"\r\n":
-                break
-            if line.lower().startswith(b"date:"):
-                # Example: b'Date: Sun, 15 Nov 2026 05:45:12 GMT\r\n'
-                parts = line.decode().strip().split()
-                if len(parts) >= 6:
-                    day = int(parts[2])
-                    month = MONTH_MAP.get(parts[3], 1)
-                    year = int(parts[4])
-                    hms = [int(x) for x in parts[5].split(":")]
-                    utc_epoch = time.mktime(
-                        (year, month, day, hms[0], hms[1], hms[2], 0, 0)
-                    )
-                    if utc_epoch > MIN_VALID_EPOCH:
-                        set_accurate_epoch(utc_epoch)
-                        print("Synced clock from local Baby Buddy HTTP Date header!")
-                        return True
+        response = http_client.request(
+            "HEAD",
+            BABY_BUDDY_BASE_URL + "/api/",
+            headers={"Connection": "close"},
+            timeout=2,
+        )
+        date_value = response.headers.get("date", "")
+        parts = date_value.split()
+        if len(parts) >= 6:
+            day = int(parts[1])
+            month = MONTH_MAP.get(parts[2])
+            year = int(parts[3])
+            hms = [int(value) for value in parts[4].split(":")]
+            if month is not None:
+                utc_epoch = time.mktime(
+                    (year, month, day, hms[0], hms[1], hms[2], 0, 0)
+                )
+                if utc_epoch > MIN_VALID_EPOCH:
+                    set_accurate_epoch(utc_epoch)
+                    print("Synced clock from local Baby Buddy HTTP Date header.")
+                    return True
     except Exception as e:
-        print("Local HTTP Date sync failed:", e)
+        print("Local HTTP Date sync failed:", type(e).__name__)
     finally:
-        if s:
+        if response:
             try:
-                s.close()
+                response.close()
             except Exception:
                 pass
         gc.collect()
@@ -688,64 +701,61 @@ def sync_clock():
 
 def connect_wifi(sync_ntp=True):
     """
-    Ensures GP29 is restored to PIO1 (alt=7) BEFORE waking the CYW43 chip
-    so wlan.active(True) never triggers a [CYW43] STALL!
+    Restore GP29 to wireless PIO before handing shared pin back to CYW43.
     """
-    global wlan, wlan_is_active
+    global wlan, wlan_is_active, wifi_shutdown_confirmed
     _diag_flow("wifi_connect_begin", "sync_ntp=%s" % sync_ntp)
     if ENABLE_CPU_UNDERCLOCK:
         machine.freq(FREQ_ACTIVE)
 
-    wlan_is_active = True
     try:
         Pin(29, Pin.ALT, pull=Pin.PULL_DOWN, alt=7)
-    except Exception:
-        pass
-
-    gc.collect()
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    try:
-        pm_perf = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11140)
-        wlan.config(pm=pm_perf)
-    except Exception:
-        pass
-
-    if wlan.isconnected():
-        if sync_ntp:
-            sync_clock()
-        _diag_flow("wifi_connect_end", "already_connected")
-        return True
-
-    _diag_flow("wifi_associate_begin")
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-
-    timeout = 24
-    step = 0
-    while not wlan.isconnected() and timeout > 0:
-        now_epoch()
-        step += 1
-        draw_modal(
-            title="CONNECTING",
-            big_line="WIFI...",
-            sub_line=WIFI_SSID[:16],
-            progress=(step / 12.0) % 1.0,
-        )
-        time.sleep_ms(400)
-        timeout -= 1
-
-    if wlan.isconnected():
-        if sync_ntp:
-            sync_clock()
-        _diag_flow("wifi_connect_end", "connected")
-        return True
-    else:
-        _diag_flow("wifi_connect_end", "timeout")
-        if ENABLE_CPU_UNDERCLOCK:
-            disable_wifi()
-        else:
-            wlan_is_active = False
+    except Exception as e:
+        _diag_flow("wifi_pin_restore_failed", type(e).__name__)
         return False
+
+    try:
+        gc.collect()
+        wlan = network.WLAN(network.STA_IF)
+        # From this point onward, conservatively assume radio owns shared pins.
+        wifi_shutdown_confirmed = False
+        wlan_is_active = True
+        wlan.active(True)
+        try:
+            pm_perf = getattr(network.WLAN, "PM_PERFORMANCE", 0xA11140)
+            wlan.config(pm=pm_perf)
+        except Exception:
+            pass
+
+        if not wlan.isconnected():
+            _diag_flow("wifi_associate_begin")
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            timeout = 24
+            step = 0
+            while not wlan.isconnected() and timeout > 0:
+                now_epoch()
+                step += 1
+                draw_modal(
+                    title="CONNECTING",
+                    big_line="WIFI...",
+                    sub_line=WIFI_SSID[:16],
+                    progress=(step / 12.0) % 1.0,
+                )
+                time.sleep_ms(400)
+                timeout -= 1
+
+        if wlan.isconnected():
+            if sync_ntp:
+                sync_clock()
+            _diag_flow("wifi_connect_end", "connected")
+            return True
+
+        _diag_flow("wifi_connect_end", "timeout")
+    except Exception as e:
+        _diag_flow("wifi_connect_failed", type(e).__name__)
+
+    disable_wifi()
+    return False
 
 
 def parse_iso_to_utc_epoch(iso_str):
@@ -789,10 +799,7 @@ def fetch_latest_feeding():
     response = None
     gc.collect()
     try:
-        try:
-            response = urequests.get(url, headers=headers, timeout=5)
-        except TypeError:
-            response = urequests.get(url, headers=headers)
+        response = http_client.get(url, headers=headers, timeout=5)
 
         if response.status_code != 200:
             print("Latest feeding lookup failed:", response.status_code)
@@ -816,7 +823,7 @@ def fetch_latest_feeding():
 
         return float(feeding.get("amount", 0)), epoch, matched_parent
     except Exception as e:
-        print("Latest feeding lookup error:", e)
+        print("Latest feeding lookup failed:", type(e).__name__)
         return None
     finally:
         if response:
@@ -833,18 +840,15 @@ def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
     connects to Wi-Fi, syncs NTP (or local HTTP Date fallback), fetches the
     latest feeding from Baby Buddy, and powers Wi-Fi back down.
     """
-    global wlan_is_active
     draw_modal("REFRESHING", "LATEST...", "Connecting Wi-Fi", progress=0.25)
 
     if connect_wifi(sync_ntp=True):
-        draw_modal("REFRESHING", "FETCHING", "Baby Buddy API", progress=0.75)
-        latest = fetch_latest_feeding()
-
-        if ENABLE_CPU_UNDERCLOCK:
-            disable_wifi()
-        else:
-            wlan_is_active = False
-            update_battery_status()
+        try:
+            draw_modal("REFRESHING", "FETCHING", "Baby Buddy API", progress=0.75)
+            latest = fetch_latest_feeding()
+        finally:
+            if not disable_wifi():
+                halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Power cycle")
 
         if latest:
             last_oz, last_epoch, fetched_parent = latest
@@ -863,23 +867,39 @@ def refresh_from_server(last_parent, last_oz, last_epoch, show_toast=True):
                 draw_modal("REFRESHED", "NO UPDATE", "Keep cached feed", progress=1.0)
                 time.sleep_ms(800)
     else:
+        if not wifi_shutdown_confirmed:
+            halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Power cycle")
         draw_modal("WIFI FAILED", "NO NET", "Keep cached feed", progress=None)
         time.sleep_ms(1200)
-        update_battery_status()
 
     return last_parent, last_oz, last_epoch
 
 
 def verify_startup_config():
+    errors = validate_config(
+        WIFI_SSID,
+        BABY_BUDDY_BASE_URL,
+        CHILD_SLUG,
+        CHILD_ID,
+        TIMEZONE_OFFSET_MINUTES,
+        PARENTS,
+    )
+    if errors:
+        print("Configuration errors:", "; ".join(errors))
+        halt_on_error("CONFIG ERROR", "CHECK .ENV", errors[0][:16])
+
+    # Establish known WLAN-off state before any future ADC(29) access.
+    if not wifi_shutdown_confirmed and not disable_wifi(sample_battery=False):
+        halt_on_error("WIFI ERROR", "RADIO STATE", "Power cycle device")
+
     if not connect_wifi(sync_ntp=True):
         halt_on_error("WIFI ERROR", "NO WIFI", "Check Config")
 
     draw_modal("STARTUP CHECK", "API...", "Checking config", progress=0.5)
 
-    if not CHILD_SLUG:
-        halt_on_error("CONFIG ERROR", "NO CHILD SLUG", "Set CHILD_SLUG")
     url = f"{BABY_BUDDY_BASE_URL}/api/children/{CHILD_SLUG}/"
 
+    child_verified = False
     for key, parent in PARENTS.items():
         headers = {
             "Authorization": f"Token {parent['api_token']}",
@@ -889,30 +909,23 @@ def verify_startup_config():
         response = None
         gc.collect()
         try:
-            try:
-                response = urequests.get(url, headers=headers, timeout=5)
-            except TypeError:
-                response = urequests.get(url, headers=headers)
+            response = http_client.get(url, headers=headers, timeout=5)
             status = response.status_code
             if status != 200:
-                print(
-                    f"Config Error for {parent['name']} (HTTP {status}):", response.text
-                )
                 if status in (401, 403):
-                    halt_on_error(
-                        "CONFIG ERROR",
-                        f"HTTP {status}",
-                        f"Bad Token:{parent['name'][:6]}",
-                    )
+                    error = ("CONFIG ERROR", f"HTTP {status}", "Check parent token")
                 elif status == 404:
-                    halt_on_error(
-                        "CONFIG ERROR", "HTTP 404", f"Bad Child ID:{CHILD_ID}"
-                    )
+                    error = ("CONFIG ERROR", "CHILD NOT FOUND", "Check slug")
                 else:
-                    halt_on_error("CONFIG ERROR", f"HTTP {status}", "Check Config")
+                    error = ("CONFIG ERROR", f"HTTP {status}", "Check config")
+            elif not child_id_matches(ujson.loads(response.text), CHILD_ID):
+                error = ("CONFIG ERROR", "CHILD ID MISMATCH", "Check CHILD_ID")
+            else:
+                error = None
+                child_verified = True
         except Exception as e:
-            print("Startup API connection failed:", e)
-            halt_on_error("CONFIG ERROR", "UNREACH", "Check Base URL")
+            print("Startup API check failed:", type(e).__name__)
+            error = ("CONFIG ERROR", "API UNREACHABLE", "Check server")
         finally:
             if response:
                 try:
@@ -920,7 +933,11 @@ def verify_startup_config():
                 except Exception:
                     pass
             gc.collect()
+        if error:
+            halt_on_error(*error)
 
+    if not child_verified:
+        halt_on_error("CONFIG ERROR", "CHILD NOT CHECKED", "Check config")
     # Ensure clock is synced (either via NTP or local Baby Buddy HTTP Date header)
     if not is_clock_valid():
         sync_clock_from_baby_buddy()
@@ -963,17 +980,12 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
 
     if not connect_wifi(sync_ntp=True):
         _diag_flow("submit_wifi_failed")
+        if not wifi_shutdown_confirmed:
+            halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Power cycle")
         draw_modal("WIFI FAILED", "NO NET", "Check Router", progress=0.0)
         time.sleep_ms(2500)
         return False
     _diag_flow("submit_wifi_ready")
-
-    draw_modal(
-        title=f"LOGGING ({parent['name'].upper()})",
-        big_line=f"{format_oz(amount_oz)} oz",
-        sub_line=feed_type["label"],
-        progress=0.75,
-    )
 
     end_epoch = now_epoch()
     # Never submit a start time in the future if submission is delayed.
@@ -1002,16 +1014,18 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
     success = False
     gc.collect()
     try:
+        draw_modal(
+            title=f"LOGGING ({parent['name'].upper()})",
+            big_line=f"{format_oz(amount_oz)} oz",
+            sub_line=feed_type["label"],
+            progress=0.75,
+        )
         body = ujson.dumps(payload)
         _diag_flow("post_begin")
-        try:
-            response = urequests.post(url, headers=headers, data=body, timeout=6)
-        except TypeError:
-            _diag_flow("post_timeout_unsupported", "retrying_without_timeout")
-            response = urequests.post(url, headers=headers, data=body)
+        response = http_client.post(url, headers=headers, data=body, timeout=6)
         _diag_flow("post_return", "status=%s" % response.status_code)
 
-        if response.status_code in (200, 201):
+        if 200 <= response.status_code < 300:
             draw_modal(
                 title="FEEDING SAVED",
                 big_line="SENT!",
@@ -1021,14 +1035,18 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
             success = True
             time.sleep_ms(1800)
         else:
-            print("API Error:", response.status_code, response.text)
-            halt_on_error(
-                "API ERROR", f"ERR {response.status_code}", "Check Tag/Config"
+            print("API rejected feeding:", response.status_code)
+            draw_modal(
+                "SAVE UNCLEAR",
+                "VERIFY LOG",
+                "Before retrying",
+                progress=0.0,
             )
+            time.sleep_ms(2500)
     except Exception as e:
         _diag_flow("post_exception", type(e).__name__)
-        print("Request Exception:", e)
-        draw_modal("SERVER ERROR", "OFFLINE", "Cannot reach API")
+        print("Request failed:", type(e).__name__)
+        draw_modal("SERVER ERROR", "NOT CONFIRMED", "Check server")
         time.sleep_ms(2500)
     finally:
         if response:
@@ -1039,9 +1057,9 @@ def submit_bottle_feeding(parent_key, amount_oz, feed_type, start_epoch):
             except Exception:
                 _diag_flow("response_close_exception")
                 pass
-        if ENABLE_CPU_UNDERCLOCK:
-            _diag_flow("submit_wifi_cleanup_begin")
-            disable_wifi()
+        _diag_flow("submit_wifi_cleanup_begin")
+        if not disable_wifi():
+            halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Power cycle")
         gc.collect()
 
     _diag_flow("submit_end", "success=%s" % success)
@@ -1077,12 +1095,9 @@ def main():
         if fetched_parent:
             last_parent = fetched_parent
 
-    # 3. Power down Wi-Fi & sample battery voltage while radio is quiet
-    if ENABLE_CPU_UNDERCLOCK:
-        disable_wifi()
-    else:
-        wlan_is_active = False
-        update_battery_status()
+    # 3. Always power down Wi-Fi before ADC(29); CPU scaling is independent.
+    if not disable_wifi():
+        halt_on_error("WIFI ERROR", "RADIO ACTIVE", "Battery safety")
 
     # Start on the idle dashboard (shows latest feeding & battery %)
     draw_dashboard(amount_oz, type_idx, last_parent, last_oz, last_epoch)
